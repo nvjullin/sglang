@@ -219,6 +219,8 @@ class TestEpToTpTransform(unittest.TestCase):
         dp_attn._LOCAL_ATTN_DP_SIZE = 1
         dp_attn._LOCAL_ATTN_DP_RANK = 0
         dp_attn._ENABLE_DP_ATTENTION_FLAG = False
+        dp_attn._ATTN_TP_RANK = cls.rank
+        dp_attn._ATTN_TP_SIZE = cls.world_size
 
     @classmethod
     def tearDownClass(cls):

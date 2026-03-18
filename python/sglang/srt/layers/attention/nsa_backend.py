@@ -408,9 +408,9 @@ class NativeSparseAttnBackend(
         #   topk_indices_offset = [0, 0, 2, 2, 2, 5, 5, 5, 5]
         topk_indices_offset = None
 
-        # Centralized dispatch: decide all strategies for this batch
         self.set_nsa_impl(forward_batch)
-        if forward_batch.forward_mode.is_decode_or_idle():
+        # forward_batch is None only for cudagraph
+        if forward_batch is None or forward_batch.forward_mode.is_decode_or_idle():
             topk_transform_method = TopkTransformMethod.PAGED
         else:
             topk_transform_method = self.get_prefill_topk_transform_method()
@@ -2077,7 +2077,8 @@ class NativeSparseAttnBackend(
         else:
             self.use_mha = False  # Decode/verify always use MLA
 
-        if forward_batch.is_decode():
+        # forward_batch is None only for cudagraph
+        if forward_batch is None or forward_batch.is_decode_or_idle():
             # decode cannot be flashmla_auto
             assert self.nsa_decode_impl == "flashmla_kv"
             return
@@ -2119,7 +2120,8 @@ class NativeSparseAttnBackend(
     def get_indexer_metadata(
         self, layer_id: int, forward_batch: ForwardBatch
     ) -> NSAIndexerMetadata:
-        if forward_batch.is_decode_or_idle():
+        # forward_batch is None only for cudagraph
+        if forward_batch is None or forward_batch.is_decode_or_idle():
             topk_transform_method = TopkTransformMethod.PAGED
         else:
             topk_transform_method = self.get_prefill_topk_transform_method()

@@ -319,11 +319,13 @@ class NativeSparseAttnBackend(
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
 
         self.use_mha: bool = False
+        self.auto_select_prefill_impl = self.nsa_prefill_impl == "flashmla_auto"
         self.nsa_prefill_impl: _NSA_IMPL_T = (
-            model_runner.server_args.nsa_prefill_backend
+            None
+            if self.auto_select_prefill_impl
+            else model_runner.server_args.nsa_prefill_backend
         )
         self.nsa_decode_impl: _NSA_IMPL_T = model_runner.server_args.nsa_decode_backend
-        self.enable_auto_select_prefill_impl = self.nsa_prefill_impl == "flashmla_auto"
 
         self._arange_buf = torch.arange(16384, device=self.device, dtype=torch.int32)
 
@@ -384,7 +386,8 @@ class NativeSparseAttnBackend(
         return page_table[:, strided_indices] // page_size
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
-        """Init the metadata for a forward pass."""
+        """Sets the metadata as fields of NativeSparseAttnBackend for a single forward pass.
+        Using the forward metadata for more than one forward pass is a bug."""
         batch_size = forward_batch.batch_size
         device = forward_batch.seq_lens.device
 
@@ -403,13 +406,20 @@ class NativeSparseAttnBackend(
         ]
 
         page_table_1_flattened = None
+        # offset of each request in the ragged kv cache
+        # topk indices needs to transform from local indices to global indices by
+        #   global_topk_indices = local_topk_indices + topk_indices_offset
+        # offset is repeated once for each token in the request in a flattened array.
+        # e.g, for two requests with lengths [2, 3, 4],
+        #   topk_indices_offset = [0, 0, 2, 2, 2, 5, 5, 5, 5]
         topk_indices_offset = None
 
         # Centralized dispatch: decide all strategies for this batch
-        self.set_nsa_prefill_impl(forward_batch)
-        topk_transform_method = self.get_topk_transform_method(
-            forward_batch.forward_mode
-        )
+        self.set_nsa_impl(forward_batch)
+        if forward_batch.forward_mode.is_decode_or_idle():
+            topk_transform_method = TopkTransformMethod.PAGED
+        else:
+            topk_transform_method = self.get_prefill_topk_transform_method()
         # Batch indices selected when cp enabled: After splitting multiple sequences,
         # a certain cp rank may not have some of these sequences.
         # We use bs_idx_cpu to mark which sequences are finally selected by the current cp rank,
@@ -787,9 +797,11 @@ class NativeSparseAttnBackend(
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
     ):
-        self.set_nsa_prefill_impl(forward_batch=None)
+        self.set_nsa_impl(forward_batch=None)
 
-        """Initialize forward metadata for capturing CUDA graph."""
+        """Sets the forward metadata as fields of NativeSparseAttnBackend for a single
+        forward pass for capturing CUDA graph. Using the forward metadata for more than
+        one forward pass is a bug."""
         if forward_mode.is_decode_or_idle():
             # Normal Decode
             # Get sequence information
@@ -944,10 +956,12 @@ class NativeSparseAttnBackend(
         seq_lens_cpu: Optional[torch.Tensor],
         out_cache_loc: Optional[torch.Tensor] = None,
     ):
-        """Initialize forward metadata for replaying CUDA graph."""
+        """Sets the forward metadata as fields of NativeSparseAttnBackend for a single
+        forward pass for replaying CUDA graph. Using the forward metadata for more than
+        one forward pass is a bug."""
         assert seq_lens_cpu is not None
 
-        self.set_nsa_prefill_impl(forward_batch=None)
+        self.set_nsa_impl(forward_batch=None)
 
         seq_lens = seq_lens[:bs]
         seq_lens_cpu = seq_lens_cpu[:bs]
@@ -1104,16 +1118,17 @@ class NativeSparseAttnBackend(
         precomputed: PrecomputedMetadata,
         forward_mode: ForwardMode,
     ):
-        """Fast path: copy precomputed metadata to this backend's metadata.
-
-        This function only performs copy operations, no computation.
+        """Sets the forward metadata as fields of NativeSparseAttnBackend for a single
+        forward pass for capturing CUDA graph. Using the forward metadata for more than
+        one forward pass is a bug. Compared to init_forward_metadata_replay_cuda_graph,
+        this function copies precomputed metadata instead of computing them.
 
         Args:
             bs: Batch size
             precomputed: Precomputed metadata to copy from
             forward_mode: Forward mode
         """
-        self.set_nsa_prefill_impl(forward_batch=None)
+        self.set_nsa_impl(forward_batch=None)
 
         metadata = self.decode_cuda_graph_metadata[bs]
 
@@ -1350,9 +1365,7 @@ class NativeSparseAttnBackend(
             topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
 
         # NOTE(dark): here, we use page size = 1
-        topk_transform_method = self.get_topk_transform_method(
-            forward_batch.forward_mode
-        )
+        topk_transform_method = self.get_prefill_topk_transform_method()
         if envs.SGLANG_NSA_FUSE_TOPK.get():
             page_table_1 = topk_indices
         else:
@@ -2056,9 +2069,10 @@ class NativeSparseAttnBackend(
         """Get the fill value for sequence length in CUDA graph."""
         return 1
 
-    def set_nsa_prefill_impl(self, forward_batch: Optional[ForwardBatch] = None):
+    def set_nsa_impl(self, forward_batch: Optional[ForwardBatch] = None):
         """
-        Decide all attention prefill dispatch strategies for this batch.
+        Decide all attention dispatch strategies for this batch.
+        Sets nsa_prefill_impl, nsa_decode_impl and use_mha depending on forward mode.
         """
         from sglang.srt.utils import get_device_sm, is_blackwell
 
@@ -2087,8 +2101,13 @@ class NativeSparseAttnBackend(
         else:
             self.use_mha = False  # Decode/verify always use MLA
 
+        if forward_batch.is_decode():
+            # decode cannot be flashmla_auto
+            assert self.nsa_decode_impl == "flashmla_kv"
+            return
+
         # Set MLA implementation only if not using MHA
-        if not self.use_mha and self.enable_auto_select_prefill_impl:
+        if not self.use_mha and self.auto_select_prefill_impl:
             if self.nsa_kv_cache_store_fp8:
                 if (
                     is_blackwell()
@@ -2106,9 +2125,7 @@ class NativeSparseAttnBackend(
                 # bf16 kv cache
                 self.nsa_prefill_impl = "flashmla_sparse"
 
-    def get_topk_transform_method(
-        self, forward_mode: Optional[ForwardMode] = None
-    ) -> TopkTransformMethod:
+    def get_prefill_topk_transform_method(self) -> TopkTransformMethod:
         """
         SGLANG_NSA_FUSE_TOPK controls whether to fuse the topk transform into the topk kernel.
         This method is used to select the topk transform method which can be fused or unfused.
@@ -2133,11 +2150,13 @@ class NativeSparseAttnBackend(
             forward_batch.hisparse_coordinator is not None
             and forward_batch.forward_mode.is_decode_or_idle()
         )
+        if forward_batch.is_decode_or_idle():
+            topk_transform_method = TopkTransformMethod.PAGED
+        else:
+            topk_transform_method = self.get_prefill_topk_transform_method()
         return NSAIndexerMetadata(
             attn_metadata=self.forward_metadata,
-            topk_transform_method=self.get_topk_transform_method(
-                forward_batch.forward_mode
-            ),
+            topk_transform_method=topk_transform_method,
             paged_mqa_schedule_metadata=self.forward_metadata.paged_mqa_schedule_metadata,
             force_unfused_topk=force_unfused,
         )
@@ -2229,7 +2248,7 @@ class NativeSparseAttnMultiStepBackend:
 
                     # Set nsa_prefill_impl for first 3 backends (required by the method)
                     for i in range(3):
-                        self.attn_backends[i].set_nsa_prefill_impl(forward_batch=None)
+                        self.attn_backends[i].set_nsa_impl(forward_batch=None)
 
                     # Prepare FlashMLA tensors if needed
                     flashmla_num_splits_src = None

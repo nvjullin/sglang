@@ -38,10 +38,9 @@ from sglang.srt.layers.attention.utils import (
     seqlens_expand_triton,
 )
 from sglang.srt.layers.dp_attention import get_attention_tp_size
+from sglang.srt.mem_cache.memory_pool import MLAKVCacheLayout
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.utils import is_cuda, is_hip
-
-from sglang.srt.mem_cache.memory_pool import MLAKVCacheLayout
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -653,6 +652,7 @@ class NativeSparseAttnBackend(
                     seq_len_q=1,
                 )
                 if self.nsa_decode_impl == "flashmla_kv"
+                or self.nsa_prefill_impl == "flashmla_kv"
                 else None
             ),
             paged_mqa_schedule_metadata=paged_mqa_schedule_metadata,

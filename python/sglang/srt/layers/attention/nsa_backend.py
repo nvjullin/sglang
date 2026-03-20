@@ -38,6 +38,8 @@ from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.utils import is_cuda, is_hip
 
+from sglang.srt.mem_cache.memory_pool import MLAKVCacheLayout
+
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -296,15 +298,13 @@ class NativeSparseAttnBackend(
         )
         self.use_nsa = is_deepseek_nsa(model_runner.model_config.hf_config)
         assert self.use_nsa, "NSA backend only supports DeepSeek NSA"
-        self.nsa_kv_cache_store_fp8 = (
-            model_runner.token_to_kv_pool.nsa_kv_cache_store_fp8
-        )
+        self.kv_cache_layout = model_runner.token_to_kv_pool.kv_cache_layout
+        self.kv_cache_size = model_runner.token_to_kv_pool.kv_cache_size
         self.nsa_index_topk = get_nsa_index_topk(model_runner.model_config.hf_config)
         self.max_context_len = model_runner.model_config.context_len
         self.num_q_heads = (
             model_runner.model_config.num_attention_heads // get_attention_tp_size()
         )
-        self.kv_cache_dim = model_runner.token_to_kv_pool.kv_cache_dim
         self.qk_nope_head_dim = model_runner.model_config.qk_nope_head_dim
         self.kv_lora_rank = model_runner.model_config.kv_lora_rank
         self.qk_rope_head_dim = model_runner.model_config.qk_rope_head_dim
@@ -314,9 +314,9 @@ class NativeSparseAttnBackend(
 
         self.use_mha: bool = False
         nsa_prefill_backend = model_runner.server_args.nsa_prefill_backend
-        self.auto_select_prefill_impl = nsa_prefill_backend == "flashmla_auto"
+        self.prefill_is_flashmla_auto = nsa_prefill_backend == "flashmla_auto"
         self.nsa_prefill_impl: _NSA_IMPL_T = (
-            None if self.auto_select_prefill_impl else nsa_prefill_backend
+            None if self.prefill_is_flashmla_auto else nsa_prefill_backend
         )
         self.nsa_decode_impl: _NSA_IMPL_T = model_runner.server_args.nsa_decode_backend
 
@@ -408,11 +408,9 @@ class NativeSparseAttnBackend(
         topk_indices_offset = None
 
         self.set_nsa_impl(forward_batch)
-        # forward_batch is None only for cudagraph
-        if forward_batch is None or forward_batch.forward_mode.is_decode_or_idle():
-            topk_transform_method = TopkTransformMethod.PAGED
-        else:
-            topk_transform_method = self.get_prefill_topk_transform_method()
+        topk_transform_method = self.get_topk_transform_method(
+            forward_batch.forward_mode
+        )
         # Batch indices selected when cp enabled: After splitting multiple sequences,
         # a certain cp rank may not have some of these sequences.
         # We use bs_idx_cpu to mark which sequences are finally selected by the current cp rank,
@@ -1358,7 +1356,9 @@ class NativeSparseAttnBackend(
             topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
 
         # NOTE(dark): here, we use page size = 1
-        topk_transform_method = self.get_prefill_topk_transform_method()
+        topk_transform_method = self.get_topk_transform_method(
+            forward_batch.forward_mode
+        )
         if envs.SGLANG_NSA_FUSE_TOPK.get():
             page_table_1 = topk_indices
         else:
@@ -1397,18 +1397,18 @@ class NativeSparseAttnBackend(
             if q_rope is not None:
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
 
-            if topk_transform_method == TopkTransformMethod.RAGGED:
-                if any(forward_batch.extend_prefix_lens_cpu):
-                    page_table_1_flattened = (
-                        self.forward_metadata.page_table_1_flattened
-                    )
-                    assert page_table_1_flattened is not None
-                    kv_cache = dequantize_k_cache_paged(
-                        kv_cache, page_table_1_flattened
-                    )
-                else:
-                    kv_cache = _cat([k, k_rope], dim=-1)
-                page_table_1 = topk_indices
+            if topk_transform_method != TopkTransformMethod.RAGGED:
+                raise ValueError(
+                    "Internal error: Unexpected topk transform method for NSA backend flashmla_sparse."
+                )
+
+            if any(forward_batch.extend_prefix_lens_cpu):
+                page_table_1_flattened = self.forward_metadata.page_table_1_flattened
+                assert page_table_1_flattened is not None
+                kv_cache = dequantize_k_cache_paged(kv_cache, page_table_1_flattened)
+            else:
+                kv_cache = _cat([k, k_rope], dim=-1)
+            page_table_1 = topk_indices
 
             return self._forward_flashmla_sparse(
                 q_all=q_all,
@@ -1703,10 +1703,14 @@ class NativeSparseAttnBackend(
 
         # TODO the 2nd dim is seq_len_q, need to be >1 when MTP
         q_all = q_all.view(-1, 1, layer.tp_q_head_num, layer.head_dim)
-        kv_cache = kv_cache.view(-1, self.real_page_size, 1, self.kv_cache_dim)
+        kv_cache = kv_cache.view(-1, self.real_page_size, 1, self.kv_cache_size)
         assert self.real_page_size == 64, "only page size 64 is supported"
 
-        if not self.nsa_kv_cache_store_fp8:
+        if self.kv_cache_layout != MLAKVCacheLayout.FP8_NOPE_WITH_BLOCK_SCALE_BF16_ROPE:
+            assert (
+                self.kv_cache_layout != MLAKVCacheLayout.FP8_NOPE_FP8_ROPE
+            ), "Internal error: NSA backend flashmla_kv does not support FP8_NOPE_FP8_ROPE"
+
             # inefficiently quantize the whole cache
             kv_cache = quantize_k_cache(kv_cache)
 
@@ -1927,6 +1931,9 @@ class NativeSparseAttnBackend(
 
         merge_query = q_rope is not None
         if self.kv_cache_dtype == torch.float8_e4m3fn:
+            assert (
+                self.kv_cache_layout == MLAKVCacheLayout.FP8_NOPE_FP8_ROPE
+            ), "Internal error: trtllm mla backend only supports FP8_NOPE_FP8_ROPE"
             # For FP8 path, we quantize the query and rope parts and merge them into a single tensor
             # Note: rope application in deepseek_v2.py:forward_absorb_prepare is skipped for FP8 decode path of this trtllm_mla backend
             assert q_rope is not None, "For FP8 path q_rope should not be None."
@@ -1963,7 +1970,9 @@ class NativeSparseAttnBackend(
             )
 
         k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
-        kv_cache = k_cache.view(-1, self.real_page_size, self.kv_cache_dim).unsqueeze(1)
+        kv_cache = k_cache.view(-1, self.real_page_size, self.kv_cache_size).unsqueeze(
+            1
+        )
 
         if merge_query:
             q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
@@ -1999,7 +2008,7 @@ class NativeSparseAttnBackend(
         _, num_heads, head_dim = q_all.shape
 
         q = q_all.view(batch_size, 1, num_heads, head_dim)
-        kv = kv_cache.view(-1, 1, self.real_page_size, self.kv_cache_dim)
+        kv = kv_cache.view(-1, 1, self.real_page_size, self.kv_cache_size)
         block_tables = page_table_1.unsqueeze(1)
         seq_lens = metadata.cache_seqlens_int32 if seq_lens is None else seq_lens
 
@@ -2082,8 +2091,11 @@ class NativeSparseAttnBackend(
             return
 
         # Set MLA implementation only if not using MHA
-        if not self.use_mha and self.auto_select_prefill_impl:
-            if self.nsa_kv_cache_store_fp8:
+        if not self.use_mha and self.prefill_is_flashmla_auto:
+            if (
+                self.kv_cache_layout
+                == MLAKVCacheLayout.FP8_NOPE_WITH_BLOCK_SCALE_BF16_ROPE
+            ):
                 if (
                     is_blackwell()
                     and forward_batch is not None
@@ -2100,14 +2112,14 @@ class NativeSparseAttnBackend(
                 # bf16 kv cache
                 self.nsa_prefill_impl = "flashmla_sparse"
 
-    def get_prefill_topk_transform_method(self) -> TopkTransformMethod:
-        """
-        SGLANG_NSA_FUSE_TOPK controls whether to fuse the topk transform into the topk kernel.
-        This method is used to select the topk transform method which can be fused or unfused.
-        """
-        if (
-            # disable for MTP
-            self.nsa_kv_cache_store_fp8
+    def get_topk_transform_method(
+        self, forward_mode: ForwardMode | None
+    ) -> TopkTransformMethod:
+        if forward_mode is None or forward_mode.is_decode_or_idle():
+            # only cudagraph has forward_mode is None
+            return TopkTransformMethod.PAGED
+        elif (
+            self.kv_cache_layout == MLAKVCacheLayout.FP8_NOPE_WITH_BLOCK_SCALE_BF16_ROPE
             and self.nsa_prefill_impl == "flashmla_sparse"
         ):
             topk_transform_method = TopkTransformMethod.RAGGED
@@ -2118,11 +2130,9 @@ class NativeSparseAttnBackend(
     def get_indexer_metadata(
         self, layer_id: int, forward_batch: ForwardBatch
     ) -> NSAIndexerMetadata:
-        # forward_batch is None only for cudagraph
-        if forward_batch is None or forward_batch.forward_mode.is_decode_or_idle():
-            topk_transform_method = TopkTransformMethod.PAGED
-        else:
-            topk_transform_method = self.get_prefill_topk_transform_method()
+        topk_transform_method = self.get_topk_transform_method(
+            forward_batch.forward_mode
+        )
         return NSAIndexerMetadata(
             attn_metadata=self.forward_metadata,
             topk_transform_method=topk_transform_method,

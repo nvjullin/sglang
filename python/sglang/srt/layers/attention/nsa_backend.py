@@ -386,6 +386,19 @@ class NativeSparseAttnBackend(
         )
         return page_table[:, strided_indices] // page_size
 
+    @staticmethod
+    def should_use_decode_backend(forward_mode: ForwardMode) -> bool:
+        """Whether the given forward mode dispatches to nsa_decode_backend.
+
+        This is answerable from static config alone (does not depend on
+        set_nsa_impl), so it is safe to call before init_forward_metadata.
+        """
+        return (
+            forward_mode.is_decode_or_idle()
+            or forward_mode.is_target_verify()
+            or forward_mode.is_draft_extend(include_v2=True)
+        )
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Sets the metadata as fields of NativeSparseAttnBackend for a single forward pass.
         Using the forward metadata for more than one forward pass is a bug."""
@@ -1290,10 +1303,7 @@ class NativeSparseAttnBackend(
 
         nsa_impl = (
             self.nsa_decode_impl
-            if (
-                forward_batch.forward_mode.is_target_verify()
-                or forward_batch.forward_mode.is_draft_extend(include_v2=True)
-            )
+            if self.should_use_decode_backend(forward_batch.forward_mode)
             else self.nsa_prefill_impl
         )
 

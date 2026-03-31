@@ -421,9 +421,6 @@ class NativeSparseAttnBackend(
 
         page_table_1_flattened = None
         # offset of each request in the ragged kv cache
-        # topk indices needs to transform from local indices to global indices by
-        #   global_topk_indices = local_topk_indices + topk_indices_offset
-        # offset is repeated once for each token in the request in a flattened array.
         # e.g, for two requests with lengths [2, 3, 4],
         #   topk_indices_offset = [0, 0, 2, 2, 2, 5, 5, 5, 5]
         topk_indices_offset = None
@@ -812,9 +809,6 @@ class NativeSparseAttnBackend(
     ):
         self.set_nsa_impl(forward_batch=None)
 
-        """Sets the forward metadata as fields of NativeSparseAttnBackend for a single
-        forward pass for capturing CUDA graph. Using the forward metadata for more than
-        one forward pass is a bug."""
         if forward_mode.is_decode_or_idle():
             # Normal Decode
             # Get sequence information
@@ -969,9 +963,6 @@ class NativeSparseAttnBackend(
         seq_lens_cpu: Optional[torch.Tensor],
         out_cache_loc: Optional[torch.Tensor] = None,
     ):
-        """Sets the forward metadata as fields of NativeSparseAttnBackend for a single
-        forward pass for replaying CUDA graph. Using the forward metadata for more than
-        one forward pass is a bug."""
         assert seq_lens_cpu is not None
 
         self.set_nsa_impl(forward_batch=None)
@@ -1131,9 +1122,7 @@ class NativeSparseAttnBackend(
         precomputed: PrecomputedMetadata,
         forward_mode: ForwardMode,
     ):
-        """Sets the forward metadata as fields of NativeSparseAttnBackend for a single
-        forward pass for capturing CUDA graph. Using the forward metadata for more than
-        one forward pass is a bug. Compared to init_forward_metadata_replay_cuda_graph,
+        """Compared to init_forward_metadata_replay_cuda_graph,
         this function copies precomputed metadata instead of computing them.
 
         Args:

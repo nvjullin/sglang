@@ -2160,19 +2160,15 @@ class NativeSparseAttnBackend(
                 self.nsa_prefill_impl = "flashmla_sparse"
 
     def get_topk_transform_method(
-        self, forward_mode: ForwardMode | None
+        self, forward_mode: Optional[ForwardMode] = None
     ) -> TopkTransformMethod:
         if forward_mode is None or forward_mode.is_decode_or_idle():
-            # only cudagraph has forward_mode is None
             return TopkTransformMethod.PAGED
         elif (
             self.kv_cache_layout == MLAKVCacheLayout.FP8_NOPE_WITH_BLOCK_SCALE_BF16_ROPE
             and self.nsa_prefill_impl == "flashmla_sparse"
         ):
             topk_transform_method = TopkTransformMethod.RAGGED
-
-            if forward_mode is not None and (forward_mode.is_decode_or_idle()):
-                topk_transform_method = TopkTransformMethod.PAGED
         else:
             topk_transform_method = TopkTransformMethod.PAGED
         return topk_transform_method

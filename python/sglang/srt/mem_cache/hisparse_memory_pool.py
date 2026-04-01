@@ -62,7 +62,7 @@ class HiSparseNSATokenToKVPool(NSATokenToKVPool):
             end_layer=end_layer,
             index_buf_size=max_total_num_tokens * host_to_device_ratio,
         )
-        self.bytes_per_token = self.kv_cache_dim * self.dtype.itemsize
+        self.bytes_per_token = self.kv_cache_size * self.dtype.itemsize
 
     def register_mapping(self, full_to_hisparse_device_index_mapping: torch.Tensor):
         self.full_to_hisparse_device_index_mapping = (

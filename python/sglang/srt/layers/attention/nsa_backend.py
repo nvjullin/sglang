@@ -420,9 +420,13 @@ class NativeSparseAttnBackend(
         ]
 
         page_table_1_flattened = None
-        # offset of each request in the ragged kv cache
-        # e.g, for two requests with lengths [2, 3, 4],
+        # Topk indices needs to transform from indices in each request to indices
+        # in the flattened array of all requests by
+        #   topk_indices = topk_indices + topk_indices_offset
+        # Offset is repeated once for each token in the request in a flattened array.
+        # e.g, for three requests with lengths [2, 3, 4],
         #   topk_indices_offset = [0, 0, 2, 2, 2, 5, 5, 5, 5]
+        # Only used for prefill with TopkTransformMethod.RAGGED.
         topk_indices_offset = None
 
         self.set_nsa_impl(forward_batch)

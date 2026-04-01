@@ -24,8 +24,8 @@ from sglang.srt.mem_cache.memory_pool import (
     HybridReqToTokenPool,
     MHATokenToKVPool,
     MHATokenToKVPoolFP4,
-    MLATokenToKVPool,
     MLAKVCacheLayout,
+    MLATokenToKVPool,
     MLATokenToKVPoolFP4,
     NSATokenToKVPool,
     ReqToTokenPool,
@@ -68,8 +68,6 @@ MAMBA_CACHE_V2_ADDITIONAL_RATIO_NO_OVERLAP = 1
 logger = logging.getLogger(__name__)
 
 _is_npu = is_npu()
-
-
 
 
 class ModelRunnerKVCacheMixin:
@@ -566,7 +564,7 @@ class ModelRunnerKVCacheMixin:
         elif self.use_mla_backend and is_nsa_model:
             kv_cache_layout, kv_cache_size = self.get_mla_kv_cache_layout()
             nsa_pool_kwargs = dict(
-                size=self.max_total_num_tokens,
+                max_total_num_tokens=self.max_total_num_tokens,
                 page_size=self.page_size,
                 dtype=self.kv_cache_dtype,
                 kv_lora_rank=self.model_config.kv_lora_rank,

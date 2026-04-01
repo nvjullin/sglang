@@ -258,23 +258,11 @@ class ModelRunnerKVCacheMixin:
         if is_nsa_model:
             prefill_is_trtllm = self.server_args.nsa_prefill_backend == "trtllm"
             decode_is_trtllm = self.server_args.nsa_decode_backend == "trtllm"
-            prefill_mixable_with_trtllm = self.server_args.nsa_prefill_backend in (
-                "flashmla_auto",
-                "flashmla_kv",
-            )
+            assert (
+                prefill_is_trtllm == decode_is_trtllm
+            ), "NSA backend trtllm cannot be mixed with other NSA backends."
 
-            if prefill_is_trtllm != decode_is_trtllm:
-                # Mixed: allow flashmla_auto/flashmla_kv prefill + trtllm decode
-                assert prefill_mixable_with_trtllm and decode_is_trtllm, (
-                    "The only NSA prefill backends mixable with trtllm decode "
-                    "are flashmla_auto and flashmla_kv, "
-                    f"got prefill={self.server_args.nsa_prefill_backend}, "
-                    f"decode={self.server_args.nsa_decode_backend}"
-                )
-                # Store in trtllm-native format; flashmla_kv transforms on-the-fly
-                use_block_scale = False
-            else:
-                use_block_scale = not prefill_is_trtllm
+            use_block_scale = not prefill_is_trtllm
         else:
             use_block_scale = False
 

@@ -17,9 +17,6 @@ from sglang.srt.layers.attention.nsa.nsa_backend_mtp_precompute import (
 )
 from sglang.srt.layers.attention.nsa.nsa_indexer import BaseIndexerMetadata
 from sglang.srt.layers.attention.nsa.quant_k_cache import quantize_k_cache
-from sglang.srt.layers.attention.nsa.requant_k_cache import (
-    requantize_fp8_to_block_scale,
-)
 from sglang.srt.layers.attention.nsa.transform_index import (
     transform_index_page_table_decode,
     transform_index_page_table_prefill,
@@ -1730,19 +1727,15 @@ class NativeSparseAttnBackend(
 
         # TODO the 2nd dim is seq_len_q, need to be >1 when MTP
         q_all = q_all.view(-1, 1, layer.tp_q_head_num, layer.head_dim)
-        # NOTE: after requantize/quantize, kv_cache width can change (e.g. 576→656),
-        # so the view below uses self.kv_cache_size (the storage size), and the
-        # transformed tensor may have a different last dim.
         kv_cache = kv_cache.view(-1, self.real_page_size, 1, self.kv_cache_size)
         assert self.real_page_size == 64, "only page size 64 is supported"
 
-        if self.kv_cache_layout == MLAKVCacheLayout.FP8_NOPE_FP8_ROPE:
-            # Mixed scenario: transform trtllm-native → block-scale for flashmla_kv
-            kv_cache = requantize_fp8_to_block_scale(kv_cache)
-        elif (
-            self.kv_cache_layout != MLAKVCacheLayout.FP8_NOPE_WITH_BLOCK_SCALE_BF16_ROPE
-        ):
-            # BF16: inefficiently quantize the whole cache
+        if self.kv_cache_layout != MLAKVCacheLayout.FP8_NOPE_WITH_BLOCK_SCALE_BF16_ROPE:
+            assert (
+                self.kv_cache_layout != MLAKVCacheLayout.FP8_NOPE_FP8_ROPE
+            ), "Internal error: NSA backend flashmla_kv does not support FP8_NOPE_FP8_ROPE"
+
+            # inefficiently quantize the whole cache
             kv_cache = quantize_k_cache(kv_cache)
 
         indices = page_table_1.unsqueeze(1)
@@ -2141,12 +2134,6 @@ class NativeSparseAttnBackend(
                     if total_kv_tokens < total_q_tokens * 512:
                         self.nsa_prefill_impl = "flashmla_sparse"
                         return
-                self.nsa_prefill_impl = "flashmla_kv"
-            elif self.kv_cache_layout == MLAKVCacheLayout.FP8_NOPE_FP8_ROPE:
-                # Mixed scenario (e.g. flashmla prefill + trtllm decode):
-                # KV cache stored in trtllm-native FP8_NOPE_FP8_ROPE format,
-                # flashmla_kv will requantize on-the-fly to block-scale format.
-                # flashmla_sparse cannot consume this layout.
                 self.nsa_prefill_impl = "flashmla_kv"
             else:
                 # bf16 kv cache

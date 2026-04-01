@@ -1440,11 +1440,11 @@ class ServerArgs:
                     "Flashmla is not supported on Blackwell device without DP attention. Set NSA prefill/decode backends to trtllm, which runs fast but loses a little accuracy."
                 )
             else:
-                # flashmla_auto dispatches to flashmla_sparse/flashmla_kv based on hardware and heuristics
+                # default to trtllm for fp8_e4m3 kv cache dtype
                 if not user_set_prefill:
-                    self.nsa_prefill_backend = "flashmla_auto"
+                    self.nsa_prefill_backend = "trtllm"
                 if not user_set_decode:
-                    self.nsa_decode_backend = "flashmla_kv"
+                    self.nsa_decode_backend = "trtllm"
         else:
             # set prefill/decode backends based on hardware architecture.
             if major >= 10:

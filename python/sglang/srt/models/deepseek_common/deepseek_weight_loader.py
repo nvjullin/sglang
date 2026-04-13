@@ -606,6 +606,25 @@ class DeepseekV2WeightLoaderMixin:
                 self_attn.w_vc = bind_or_assign(self_attn.w_vc, w_vc.contiguous())
                 self_attn.use_deep_gemm_bmm = True
 
+        # BF16 indexer mode: dequantize FP8 indexer wq_b/wk weights to BF16 at load time
+        # so that forward passes use plain BF16 linears (no FP8 activation quant needed).
+        if get_global_server_args().nsa_indexer_bf16 and not is_nextn:
+            all_layer_ids = range(self.model.start_layer, self.model.end_layer)
+            for layer_id in all_layer_ids:
+                self_attn = self.model.layers[layer_id].self_attn
+                if not (hasattr(self_attn, "use_nsa") and self_attn.use_nsa):
+                    continue
+                if not hasattr(self_attn, "indexer"):
+                    continue
+                for linear in (self_attn.indexer.wq_b, self_attn.indexer.wk):
+                    w = linear.weight
+                    if w.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz):
+                        scale_param = getattr(linear, "weight_scale_inv", None)
+                        if scale_param is not None:
+                            linear.weight.data = block_quant_dequant(
+                                w, scale_param.data, [128, 128], torch.bfloat16
+                            )
+
     @classmethod
     def generate_weight_name_filter(cls, logical_experts_map: Dict[int, List[int]]):
         """

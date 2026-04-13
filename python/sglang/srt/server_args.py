@@ -677,6 +677,7 @@ class ServerArgs:
     # Context parallelism used in the long sequence prefill phase of DeepSeek v3.2
     enable_nsa_prefill_context_parallel: bool = False
     nsa_prefill_cp_mode: str = "round-robin-split"
+    nsa_indexer_bf16: bool = False
     enable_fused_qk_norm_rope: bool = False
     enable_precise_embedding_interpolation: bool = False
     enable_fused_moe_sum_all_reduce: bool = False
@@ -4941,6 +4942,15 @@ class ServerArgs:
             type=str,
             choices=NSA_CHOICES,
             help="NSA decode backend. If not specified, auto-detects based on hardware and kv_cache_dtype.",
+        )
+        parser.add_argument(
+            "--nsa-indexer-bf16",
+            action="store_true",
+            default=ServerArgs.nsa_indexer_bf16,
+            help="Use BF16 (no FP8 activation quant, no Hadamard) for NSA indexer prefill scoring. "
+            "wq_b and wk weights are dequantized to BF16 at load time. "
+            "K cache is still stored as FP8+Hadamard for decode compatibility. "
+            "Only supported on CUDA. Intended for models with BF16 indexer weights (e.g. GLM-5-FP8).",
         )
         parser.add_argument(
             "--fp8-gemm-backend",

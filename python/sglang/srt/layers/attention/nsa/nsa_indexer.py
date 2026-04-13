@@ -146,6 +146,40 @@ def rotate_activation(x: torch.Tensor) -> torch.Tensor:
     return hadamard_transform(x, scale=hidden_size**-0.5)
 
 
+def bf16_mqa_logits(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    weights: torch.Tensor,
+    ks: torch.Tensor,
+    ke: torch.Tensor,
+    softmax_scale: float,
+) -> torch.Tensor:
+    """
+    Ragged MQA logits in BF16 — mirrors the deep_gemm.fp8_mqa_logits interface.
+
+    Args:
+        q:       (T, H, D)  bfloat16  — query tokens
+        k:       (S, D)     bfloat16  — key tokens (ragged / contiguous)
+        weights: (T, H)     bfloat16  — per-head gate weights
+        ks:      (T,)       int32     — start of valid K range per query token
+        ke:      (T,)       int32     — end of valid K range per query token
+        softmax_scale: float
+
+    Returns:
+        logits: (T, S) float32
+
+    NOTE: ks/ke are NOT used inside this function — they mirror the fp8_mqa_logits
+    interface and are passed by the caller to topk_transform afterwards.
+
+    TODO: replace with a fused triton/tilelang kernel for better performance.
+    """
+    # (T, H, D) x (S, D)^T -> (T, H, S)
+    qk = torch.einsum("thd,sd->ths", q.float(), k.float()) * softmax_scale
+    # head-weighted ReLU reduction -> (T, S) float32
+    logits = (torch.relu(qk) * weights.float().unsqueeze(-1)).sum(dim=1)
+    return logits
+
+
 class Indexer(MultiPlatformOp):
     def __init__(
         self,
@@ -190,11 +224,16 @@ class Indexer(MultiPlatformOp):
         else:
             self.logits_with_pp_recv = False
 
+        self.use_bf16_index = _is_cuda and get_global_server_args().nsa_indexer_bf16
+        # In BF16 indexer mode, wq_b and wk are plain BF16 linears.
+        # FP8 checkpoint weights are dequantized to BF16 at load time (deepseek_weight_loader.py).
+        _indexer_quant = None if self.use_bf16_index else quant_config
+
         self.wq_b = ReplicatedLinear(
             self.q_lora_rank,
             self.n_heads * self.head_dim,
             bias=False,
-            quant_config=quant_config,
+            quant_config=_indexer_quant,
             prefix=add_prefix("wq_b", prefix),
         )
 
@@ -202,7 +241,7 @@ class Indexer(MultiPlatformOp):
             self.hidden_size,
             self.head_dim,
             bias=False,
-            quant_config=quant_config,
+            quant_config=_indexer_quant,
             prefix=add_prefix("wk", prefix),
         )
         self.weights_proj = ReplicatedLinear(
@@ -270,6 +309,13 @@ class Indexer(MultiPlatformOp):
         weights = weights.unsqueeze(-1) * q_scale * self.softmax_scale
         return weights
 
+    @torch.compile(dynamic=True)
+    def _project_and_scale_head_gates_bf16(self, x: torch.Tensor) -> torch.Tensor:
+        # BF16 variant — used in BF16 indexer mode where no q_scale multiplication is needed.
+        # weights_proj has params_dtype=bfloat16 and no quant_config, so output stays BF16.
+        weights, _ = self.weights_proj(x)
+        return weights * (self.n_heads**-0.5)
+
     def _get_q_k_bf16(
         self,
         q_lora: torch.Tensor,
@@ -324,20 +370,23 @@ class Indexer(MultiPlatformOp):
         if enable_dual_stream:
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)
-            query = rotate_activation(query)
+            if not self.use_bf16_index:
+                query = rotate_activation(query)
 
-            with torch.cuda.stream(self.alt_stream):
-                key = rotate_activation(key)
-            current_stream.wait_stream(self.alt_stream)
+                with torch.cuda.stream(self.alt_stream):
+                    key = rotate_activation(key)
+                current_stream.wait_stream(self.alt_stream)
         elif (
             self.alt_stream is not None
             and forward_batch.nsa_cp_metadata is not None
             and self.nsa_enable_prefill_cp
         ):
-            key = rotate_activation(key)
+            if not self.use_bf16_index:
+                key = rotate_activation(key)
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)
-            query = rotate_activation(query)
+            if not self.use_bf16_index:
+                query = rotate_activation(query)
 
             with torch.cuda.stream(self.alt_stream):
                 key = cp_all_gather_rerange_output(
@@ -349,8 +398,9 @@ class Indexer(MultiPlatformOp):
             current_stream.wait_stream(self.alt_stream)
             return query, key
         else:
-            query = rotate_activation(query)
-            key = rotate_activation(key)
+            if not self.use_bf16_index:
+                query = rotate_activation(query)
+                key = rotate_activation(key)
 
         # allgather+rerrange
         if forward_batch.nsa_cp_metadata is not None and self.nsa_enable_prefill_cp:
@@ -377,7 +427,8 @@ class Indexer(MultiPlatformOp):
 
         _, k_rope = self.rotary_emb(positions, k_rope, k_rope)
         self._update_rope_guarded(key[..., : self.rope_head_dim], k_rope)
-        key = rotate_activation(key)
+        if not self.use_bf16_index:
+            key = rotate_activation(key)
 
         return key
 
@@ -696,6 +747,75 @@ class Indexer(MultiPlatformOp):
 
         return topk_result
 
+    def _get_topk_ragged_bf16(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        weights: torch.Tensor,
+        forward_batch: ForwardBatch,
+        metadata: BaseIndexerMetadata,
+    ) -> torch.Tensor:
+        """
+        Compute top-k indices for a prefill batch using plain BF16 BMM scoring.
+
+        q:       (T_extend, H, D)  bfloat16
+        k:       (T_extend, D)     bfloat16 — extend-only K, NOT Hadamard-rotated
+        weights: (T_extend, H)     bfloat16
+
+        TODO: chunked-prefill guard — when extend_len < seq_len, prefix K tokens
+        already stored in the FP8 K cache are silently skipped here, making the
+        scoring incomplete.  Until this is handled, --nsa-indexer-bf16 should only
+        be used with --disable-radix-cache and a chunked-prefill-size large enough
+        that most requests fit in a single chunk.
+        """
+        assert forward_batch.forward_mode.is_extend_without_speculative()
+        assert (
+            forward_batch.seq_lens_cpu is not None
+            and forward_batch.extend_seq_lens_cpu is not None
+        )
+
+        seq_lens_cpu = forward_batch.seq_lens_cpu
+        extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
+        batch_size = len(seq_lens_cpu)
+        T_extend = q.shape[0]
+        device = q.device
+
+        topk_result = torch.full(
+            (T_extend, self.index_topk), -1, device=device, dtype=torch.int32
+        )
+        if batch_size == 0:
+            return topk_result
+
+        q_off = k_off = k_cache_off = 0
+        for i in range(batch_size):
+            extend_len = int(extend_seq_lens_cpu[i])
+            seq_len = int(seq_lens_cpu[i])
+
+            q_i = q[q_off : q_off + extend_len]  # (extend_len, H, D)
+            k_i = k[k_off : k_off + extend_len]  # (extend_len, D)
+            w_i = weights[q_off : q_off + extend_len]  # (extend_len, H)
+
+            # causal masking: token t can attend to k[0..t]
+            ks_i = torch.zeros(extend_len, dtype=torch.int32, device=device)
+            ke_i = torch.arange(1, extend_len + 1, dtype=torch.int32, device=device)
+
+            logits_i = bf16_mqa_logits(q_i, k_i, w_i, ks_i, ke_i, self.softmax_scale)
+            # logits_i: (extend_len, extend_len) float32
+
+            raw_topk = metadata.topk_transform(logits_i, self.index_topk, ks=ks_i)
+            # raw_topk indices are in [0, extend_len); offset to global K-cache positions
+            prefix_len = seq_len - extend_len
+            global_offset = k_cache_off + prefix_len  # prefix slots come first in cache
+            topk_result[q_off : q_off + extend_len] = raw_topk + global_offset
+
+            q_off += extend_len
+            k_off += extend_len
+            k_cache_off += (
+                seq_len  # cache offset advances by full seq_len (prefix+extend)
+            )
+
+        return topk_result
+
     def _forward_cuda_k_only(
         self,
         x: torch.Tensor,
@@ -712,6 +832,10 @@ class Indexer(MultiPlatformOp):
 
         # Fast path: only compute and store k cache, skip all q and weights ops
         key = self._get_k_bf16(x, positions, enable_dual_stream)
+        # In BF16 mode, _get_k_bf16 skips the Hadamard transform; re-apply here
+        # so that the K cache is stored in Hadamard+FP8 format for decode compatibility.
+        if self.use_bf16_index:
+            key = rotate_activation(key)
 
         if not forward_batch.out_cache_loc.is_contiguous():
             forward_batch.out_cache_loc = forward_batch.out_cache_loc.contiguous()
@@ -1079,6 +1203,41 @@ class Indexer(MultiPlatformOp):
                 return_indices,
             )
 
+        # BF16 prefill path: skip Hadamard+FP8 activation quantization for scoring,
+        # but still store Hadamard+FP8 K in cache for decode compatibility.
+        if (
+            self.use_bf16_index
+            and forward_batch.forward_mode.is_extend_without_speculative()
+            and not self.nsa_enable_prefill_cp
+        ):
+            query, key = self._get_q_k_bf16(
+                q_lora, x, positions, enable_dual_stream, forward_batch=forward_batch
+            )
+            # Store K with Hadamard applied so decode (FP8 path) can read it correctly.
+            rotated_key = rotate_activation(key)
+            if enable_dual_stream:
+                current_stream = torch.cuda.current_stream()
+                self.alt_stream.wait_stream(current_stream)
+                with torch.cuda.stream(self.alt_stream):
+                    self._store_index_k_cache(
+                        forward_batch=forward_batch,
+                        layer_id=layer_id,
+                        key=rotated_key,
+                        act_quant=act_quant,
+                    )
+                current_stream.wait_stream(self.alt_stream)
+            else:
+                self._store_index_k_cache(
+                    forward_batch=forward_batch,
+                    layer_id=layer_id,
+                    key=rotated_key,
+                    act_quant=act_quant,
+                )
+            weights_bf16 = self._project_and_scale_head_gates_bf16(x)
+            return self._get_topk_ragged_bf16(
+                query, key, weights_bf16, forward_batch, metadata
+            )
+
         if enable_dual_stream and forward_batch.forward_mode.is_decode_or_idle():
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)
@@ -1086,12 +1245,15 @@ class Indexer(MultiPlatformOp):
             query, key = self._get_q_k_bf16(
                 q_lora, x, positions, enable_dual_stream, forward_batch=forward_batch
             )
-            q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
+            # In BF16 mode, _get_q_k_bf16 skips Hadamard; apply it before act_quant/store.
+            q_input = rotate_activation(query) if self.use_bf16_index else query
+            store_key = rotate_activation(key) if self.use_bf16_index else key
+            q_fp8, q_scale = act_quant(q_input, self.block_size, self.scale_fmt)
             with torch.cuda.stream(self.alt_stream):
                 self._store_index_k_cache(
                     forward_batch=forward_batch,
                     layer_id=layer_id,
-                    key=key,
+                    key=store_key,
                     act_quant=act_quant,
                 )
             current_stream.wait_stream(self.alt_stream)
@@ -1105,21 +1267,27 @@ class Indexer(MultiPlatformOp):
                 current_stream = torch.cuda.current_stream()
                 self.alt_stream.wait_stream(current_stream)
 
-                q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
+                # In BF16 mode, _get_q_k_bf16 skips Hadamard; apply it before act_quant/store.
+                q_input = rotate_activation(query) if self.use_bf16_index else query
+                store_key = rotate_activation(key) if self.use_bf16_index else key
+                q_fp8, q_scale = act_quant(q_input, self.block_size, self.scale_fmt)
                 with torch.cuda.stream(self.alt_stream):
                     self._store_index_k_cache(
                         forward_batch=forward_batch,
                         layer_id=layer_id,
-                        key=key,
+                        key=store_key,
                         act_quant=act_quant,
                     )
                 current_stream.wait_stream(self.alt_stream)
             else:
-                q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
+                # In BF16 mode, _get_q_k_bf16 skips Hadamard; apply it before act_quant/store.
+                q_input = rotate_activation(query) if self.use_bf16_index else query
+                store_key = rotate_activation(key) if self.use_bf16_index else key
+                q_fp8, q_scale = act_quant(q_input, self.block_size, self.scale_fmt)
                 self._store_index_k_cache(
                     forward_batch=forward_batch,
                     layer_id=layer_id,
-                    key=key,
+                    key=store_key,
                     act_quant=act_quant,
                 )
 

@@ -953,6 +953,144 @@ class TestBF16PrefillForward(_NSAIndexerBF16Base):
             "k[0] (most similar to q[0]) should be the top-ranked token for query 0",
         )
 
+    @patch("sglang.srt.layers.attention.nsa.nsa_indexer.deep_gemm")
+    def test_bf16_prefill_causal_masking(self, mock_dg):
+        """Token at position t must not attend to future tokens (positions > t).
+
+        Without causal masking, k[3] (the strongest key) would be top-1 for all
+        queries.  With causal masking, token 0's top-1 must be k[0] (the only
+        visible token), and token 3's top-1 must be k[3].
+
+        We use index_topk=1 so the test checks the single highest-ranked index
+        directly, avoiding the ambiguity of how -inf-valued positions are ordered
+        in the full-topk output.
+        """
+        mock_dg.get_num_sms.return_value = 132
+        self._set_server_args(bf16=True)
+        device = "cuda"
+        H = self.config["index_n_heads"]
+        D = self.config["index_head_dim"]
+        extend_len = 4
+        topk = 1  # top-1 only — unambiguous test
+
+        # k[3] is the strongest key (unit vector); k[0] is a weaker match.
+        # Without causal masking every query would rank k[3] first.
+        k = torch.zeros(extend_len, D, dtype=torch.bfloat16, device=device)
+        k[3] = torch.ones(D, dtype=torch.bfloat16, device=device)
+        k[0] = torch.ones(D, dtype=torch.bfloat16, device=device) * 0.5
+
+        # Queries are positive-aligned with all k vectors.
+        q = torch.ones(extend_len, H, D, dtype=torch.bfloat16, device=device) * 0.1
+        w = torch.ones(extend_len, H, dtype=torch.bfloat16, device=device)
+
+        # Minimal forward_batch mock: single sequence of length extend_len.
+        fb = MagicMock()
+        fb.seq_lens_cpu = torch.tensor([extend_len], dtype=torch.int32)
+        fb.extend_seq_lens_cpu = torch.tensor([extend_len], dtype=torch.int32)
+
+        meta = MockIndexerMetadata(1, [extend_len])
+
+        torch.set_default_dtype(torch.bfloat16)
+        indexer = Indexer(
+            hidden_size=self.config["hidden_size"],
+            index_n_heads=H,
+            index_head_dim=D,
+            rope_head_dim=self.config["rope_head_dim"],
+            index_topk=topk,
+            q_lora_rank=self.config["q_lora_rank"],
+            max_position_embeddings=self.config["max_position_embeddings"],
+            rope_theta=self.config["rope_theta"],
+            layer_id=self.config["layer_id"],
+            scale_fmt="ue8m0",
+        ).to(device)
+
+        result = indexer._get_topk_ragged_bf16(q, k, w, fb, meta)
+        # result shape: (extend_len, topk=1)
+
+        # With prefix_len=0 and k_cache_off=0, result indices map directly to
+        # K-cache positions [0, extend_len).
+        top1_row0 = result[0, 0].item()
+        top1_row3 = result[3, 0].item()
+
+        self.assertEqual(
+            top1_row0,
+            0,
+            f"Token 0's top-1 must be k[0] (only causal token visible), got {top1_row0}",
+        )
+        self.assertEqual(
+            top1_row3,
+            3,
+            f"Token 3's top-1 must be k[3] (strongest key), got {top1_row3}",
+        )
+
+    @patch("sglang.srt.layers.attention.nsa.nsa_indexer.deep_gemm")
+    def test_bf16_prefill_chunked_q_same_result(self, mock_dg):
+        """Q-dimension chunking must produce the same top-1 index as full-batch scoring.
+
+        We force tiny chunks (max_chunk_q=1) by mocking torch.cuda.mem_get_info
+        so that the chunk-size computation caps at 1 row per chunk.  With topk=1,
+        each row's single returned index must match the full-batch result — this
+        verifies that chunking applies the correct per-row causal mask and picks
+        the same best valid token.
+
+        We use index_topk=1 to avoid the ambiguity of -inf-valued positions being
+        included in the full topk output by the mock's topk_transform.
+        """
+        mock_dg.get_num_sms.return_value = 132
+        self._set_server_args(bf16=True)
+        device = "cuda"
+        H = self.config["index_n_heads"]
+        D = self.config["index_head_dim"]
+        extend_len = 8
+        topk = 1  # top-1 for an unambiguous comparison
+
+        torch.manual_seed(7)
+        # Use positive q and k so all relu(q·k) > 0 — avoids zero-logit ties.
+        q = torch.abs(
+            torch.randn(extend_len, H, D, dtype=torch.bfloat16, device=device)
+        )
+        k = torch.abs(torch.randn(extend_len, D, dtype=torch.bfloat16, device=device))
+        w = torch.rand(extend_len, H, dtype=torch.bfloat16, device=device).abs() + 0.1
+
+        fb = MagicMock()
+        fb.seq_lens_cpu = torch.tensor([extend_len], dtype=torch.int32)
+        fb.extend_seq_lens_cpu = torch.tensor([extend_len], dtype=torch.int32)
+
+        meta = MockIndexerMetadata(1, [extend_len])
+
+        torch.set_default_dtype(torch.bfloat16)
+        indexer = Indexer(
+            hidden_size=self.config["hidden_size"],
+            index_n_heads=H,
+            index_head_dim=D,
+            rope_head_dim=self.config["rope_head_dim"],
+            index_topk=topk,
+            q_lora_rank=self.config["q_lora_rank"],
+            max_position_embeddings=self.config["max_position_embeddings"],
+            rope_theta=self.config["rope_theta"],
+            layer_id=self.config["layer_id"],
+            scale_fmt="ue8m0",
+        ).to(device)
+
+        # Full-batch result (default chunk size — large enough for 8 rows).
+        result_full = indexer._get_topk_ragged_bf16(q, k, w, fb, meta)
+
+        # Force max_chunk_q=1 by returning ~0 free memory from mem_get_info.
+        # Patch at the call site (torch.cuda.mem_get_info is looked up via torch in the module).
+        total_mem = torch.cuda.mem_get_info(device)[1]
+        with patch("torch.cuda.mem_get_info", return_value=(0, total_mem)):
+            result_chunked = indexer._get_topk_ragged_bf16(q, k, w, fb, meta)
+
+        # result shape: (extend_len, topk=1).  Each row's top-1 index must match.
+        for row in range(extend_len):
+            full_idx = result_full[row, 0].item()
+            chunked_idx = result_chunked[row, 0].item()
+            self.assertEqual(
+                full_idx,
+                chunked_idx,
+                f"Row {row}: chunked top-1={chunked_idx} != full top-1={full_idx}",
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

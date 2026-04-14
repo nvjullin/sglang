@@ -762,6 +762,13 @@ class Indexer(MultiPlatformOp):
         k:       (T_extend, D)     bfloat16 — extend-only K, NOT Hadamard-rotated
         weights: (T_extend, H)     bfloat16
 
+        Memory safety: the (T, H, S) float32 intermediate from bf16_mqa_logits can
+        be very large.  We chunk the Q dimension so each chunk's intermediate fits
+        within 25% of free GPU memory (at least 1 row to ensure progress).
+
+        Causal masking: bf16_mqa_logits ignores ks/ke.  We apply an explicit causal
+        mask to zero out future positions before calling topk_transform.
+
         TODO: chunked-prefill guard — when extend_len < seq_len, prefix K tokens
         already stored in the FP8 K cache are silently skipped here, making the
         scoring incomplete.  Until this is handled, --nsa-indexer-bf16 should only
@@ -790,21 +797,57 @@ class Indexer(MultiPlatformOp):
         for i in range(batch_size):
             extend_len = int(extend_seq_lens_cpu[i])
             seq_len = int(seq_lens_cpu[i])
+            prefix_len = seq_len - extend_len
 
             q_i = q[q_off : q_off + extend_len]  # (extend_len, H, D)
             k_i = k[k_off : k_off + extend_len]  # (extend_len, D)
             w_i = weights[q_off : q_off + extend_len]  # (extend_len, H)
 
-            # causal masking: token t can attend to k[0..t]
-            ks_i = torch.zeros(extend_len, dtype=torch.int32, device=device)
-            ke_i = torch.arange(1, extend_len + 1, dtype=torch.int32, device=device)
+            # Determine Q chunk size to bound peak (chunk_q, H, S) float32 memory.
+            # bytes_per_q_row = extend_len * n_heads * 4 (float32 per element)
+            # We target at most 25% of free memory per chunk.
+            free_mem, _ = torch.cuda.mem_get_info(device)
+            bytes_per_q_row = extend_len * self.n_heads * 4
+            max_chunk_q = max(1, int(free_mem * 0.25 / max(bytes_per_q_row, 1)))
+            max_chunk_q = min(max_chunk_q, extend_len)
 
-            logits_i = bf16_mqa_logits(q_i, k_i, w_i, ks_i, ke_i, self.softmax_scale)
-            # logits_i: (extend_len, extend_len) float32
+            # seq_pos used for explicit causal masking (bf16_mqa_logits ignores ks/ke)
+            seq_pos = torch.arange(extend_len, dtype=torch.int32, device=device)
 
-            raw_topk = metadata.topk_transform(logits_i, self.index_topk, ks=ks_i)
+            chunk_topks = []
+            for t_start in range(0, extend_len, max_chunk_q):
+                t_end = min(t_start + max_chunk_q, extend_len)
+                chunk_len = t_end - t_start
+
+                q_chunk = q_i[t_start:t_end]  # (chunk_len, H, D)
+                w_chunk = w_i[t_start:t_end]  # (chunk_len, H)
+
+                # ks/ke are only passed through to topk_transform; bf16_mqa_logits
+                # ignores them — causal masking is applied explicitly below.
+                ks_chunk = torch.zeros(chunk_len, dtype=torch.int32, device=device)
+                ke_chunk = torch.arange(
+                    t_start + 1, t_end + 1, dtype=torch.int32, device=device
+                )
+
+                # (chunk_len, extend_len) float32
+                logits_chunk = bf16_mqa_logits(
+                    q_chunk, k_i, w_chunk, ks_chunk, ke_chunk, self.softmax_scale
+                )
+
+                # Explicit causal mask: query at position t (= t_start+j) must not
+                # attend to key positions >= t+1 (i.e., seq_pos >= ke_chunk[j]).
+                # causal_mask shape: (chunk_len, extend_len)
+                causal_mask = seq_pos.unsqueeze(0) >= ke_chunk.unsqueeze(1)
+                logits_chunk = logits_chunk.masked_fill(causal_mask, float("-inf"))
+
+                chunk_topk = metadata.topk_transform(
+                    logits_chunk, self.index_topk, ks=ks_chunk
+                )
+                chunk_topks.append(chunk_topk)
+
+            raw_topk = torch.cat(chunk_topks, dim=0)  # (extend_len, index_topk)
+
             # raw_topk indices are in [0, extend_len); offset to global K-cache positions
-            prefix_len = seq_len - extend_len
             global_offset = k_cache_off + prefix_len  # prefix slots come first in cache
             topk_result[q_off : q_off + extend_len] = raw_topk + global_offset
 

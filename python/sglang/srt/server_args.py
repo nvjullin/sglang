@@ -1085,6 +1085,14 @@ class ServerArgs:
 
         capture_bs = [bs for bs in capture_bs if bs <= self.cuda_graph_max_bs]
 
+        # Ensure cuda_graph_max_bs itself is captured. The stride-based ranges
+        # above can otherwise leave it uncovered (e.g. with stride 16 from 272,
+        # max_bs=580 stops at 576), causing batches in (last_captured, max_bs]
+        # to silently fall off the cuda-graph path.
+        if self.cuda_graph_max_bs not in capture_bs:
+            capture_bs.append(self.cuda_graph_max_bs)
+            capture_bs.sort()
+
         return capture_bs
 
     def _generate_piecewise_cuda_graph_tokens(self):

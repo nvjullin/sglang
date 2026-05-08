@@ -19,6 +19,7 @@ from typing import Dict, List, Optional, Sequence, Set, Union
 
 import msgspec
 
+from sglang.srt.environ import envs
 from sglang.srt.sampling.watermarking.core import (
     WatermarkRequestConfig,
     normalize_watermark_request,
@@ -135,6 +136,94 @@ def set_request_reasoning_in_grammar(sampling_params: Dict, enabled: bool) -> No
     custom_params = dict(sampling_params.get("custom_params") or {})
     custom_params[REQUEST_REASONING_IN_GRAMMAR_KEY] = True
     sampling_params["custom_params"] = custom_params
+
+
+# Debug-only forced decoding, gated by SGLANG_ENABLE_FORCED_TOKEN_IDS: the
+# sampler emits these ids step by step instead of its own choice. They ride in
+# custom_params so the public SamplingParams wire layout stays unchanged.
+FORCED_TOKEN_IDS_KEY = "__sglang_forced_token_ids"
+# Server-side torch file holding the ids (a 1-D int tensor, or a dict with an
+# "output_ids" one); resolve_forced_token_ids_path swaps it for the ids.
+FORCED_TOKEN_IDS_PATH_KEY = "__sglang_forced_token_ids_path"
+# Bounds the work done at admission; arbitrary, raise it if a test needs more.
+MAX_FORCED_TOKEN_IDS_LENGTH = 512 * 1024
+
+
+def get_forced_token_ids(
+    custom_params: Optional[Dict[str, CustomParamValue]],
+) -> Optional[List[int]]:
+    if not isinstance(custom_params, dict):
+        return None
+    return custom_params.get(FORCED_TOKEN_IDS_KEY)
+
+
+def _load_forced_token_ids(path: str) -> List[int]:
+    # Lazy import: SamplingParams is built on paths that don't otherwise need torch.
+    import torch
+
+    try:
+        loaded = torch.load(path, map_location="cpu", weights_only=True)
+    except Exception as e:
+        raise ValueError(f"Failed to load forced token ids from {path!r}: {e}") from e
+
+    if isinstance(loaded, dict):
+        if "output_ids" not in loaded:
+            raise ValueError(f"forced token ids file {path!r} has no 'output_ids' key")
+        loaded = loaded["output_ids"]
+    if not isinstance(loaded, torch.Tensor):
+        raise ValueError(
+            f"forced token ids file {path!r} did not contain a tensor "
+            f"(got {type(loaded).__name__})"
+        )
+    if loaded.dim() != 1:
+        raise ValueError(
+            f"forced token ids tensor in {path!r} must be 1-D, "
+            f"got shape {tuple(loaded.shape)}"
+        )
+    if torch.is_floating_point(loaded) or loaded.dtype == torch.bool:
+        raise ValueError(
+            f"forced token ids tensor in {path!r} must be an integer dtype, "
+            f"got {loaded.dtype}"
+        )
+    if loaded.numel() > MAX_FORCED_TOKEN_IDS_LENGTH:
+        raise ValueError(
+            f"forced token ids in {path!r} has length {loaded.numel()}, over "
+            f"MAX_FORCED_TOKEN_IDS_LENGTH ({MAX_FORCED_TOKEN_IDS_LENGTH})"
+        )
+    return [int(t) for t in loaded.tolist()]
+
+
+def _verify_forced_token_ids(
+    custom_params: Optional[Dict[str, CustomParamValue]], vocab_size: int
+) -> None:
+    if not isinstance(custom_params, dict):
+        return
+    token_ids = custom_params.get(FORCED_TOKEN_IDS_KEY)
+    has_path = FORCED_TOKEN_IDS_PATH_KEY in custom_params
+    if token_ids is None and not has_path:
+        return
+    if not envs.SGLANG_ENABLE_FORCED_TOKEN_IDS.get():
+        raise ValueError(
+            "forced token ids require SGLANG_ENABLE_FORCED_TOKEN_IDS=1 on the server."
+        )
+    if token_ids is not None and has_path:
+        raise ValueError(
+            f"Only one of {FORCED_TOKEN_IDS_KEY} or {FORCED_TOKEN_IDS_PATH_KEY} "
+            "can be set."
+        )
+    if token_ids is None:
+        return
+    if not isinstance(token_ids, list) or len(token_ids) > MAX_FORCED_TOKEN_IDS_LENGTH:
+        raise ValueError(
+            f"{FORCED_TOKEN_IDS_KEY} must be a list of at most "
+            f"{MAX_FORCED_TOKEN_IDS_LENGTH} token ids."
+        )
+    for token_id in token_ids:
+        if type(token_id) is not int or not 0 <= token_id < vocab_size:
+            raise ValueError(
+                f"{FORCED_TOKEN_IDS_KEY} must be in [0, {vocab_size - 1}], "
+                f"got {token_id!r}."
+            )
 
 
 class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
@@ -316,6 +405,7 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
             vocab_size=vocab_size,
             strict=True,
         )
+        _verify_forced_token_ids(self.custom_params, vocab_size=vocab_size)
 
         grammars = [
             self.json_schema,
@@ -327,6 +417,36 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
             raise ValueError(
                 "Only one of json_schema, regex, ebnf, or structural_tag can be set."
             )
+
+    def resolve_forced_token_ids_path(self):
+        """Replace a forced-token-ids path in custom_params with the ids it holds.
+
+        Must run before `verify()`. Checks the env-var gate first, so servers that
+        have not opted in do no disk I/O.
+        """
+        if (
+            not isinstance(self.custom_params, dict)
+            or FORCED_TOKEN_IDS_PATH_KEY not in self.custom_params
+        ):
+            return
+        if not envs.SGLANG_ENABLE_FORCED_TOKEN_IDS.get():
+            raise ValueError(
+                f"{FORCED_TOKEN_IDS_PATH_KEY} requires "
+                "SGLANG_ENABLE_FORCED_TOKEN_IDS=1 on the server."
+            )
+        if FORCED_TOKEN_IDS_KEY in self.custom_params:
+            raise ValueError(
+                f"Only one of {FORCED_TOKEN_IDS_KEY} or {FORCED_TOKEN_IDS_PATH_KEY} "
+                "can be set."
+            )
+        path = self.custom_params[FORCED_TOKEN_IDS_PATH_KEY]
+        if not isinstance(path, str):
+            raise ValueError(f"{FORCED_TOKEN_IDS_PATH_KEY} must be a string path.")
+        # Copy: the request's custom_params dict may be shared across a batch.
+        custom_params = dict(self.custom_params)
+        del custom_params[FORCED_TOKEN_IDS_PATH_KEY]
+        custom_params[FORCED_TOKEN_IDS_KEY] = _load_forced_token_ids(path)
+        self.custom_params = custom_params
 
     def normalize(self, tokenizer):
         # Process stop strings

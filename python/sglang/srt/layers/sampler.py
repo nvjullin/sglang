@@ -316,6 +316,18 @@ class Sampler(nn.Module):
                     )
                 del probs
 
+        # Forced-token-ids debug feature: replace the sampled token with the
+        # request's forced token (sentinel -1 = not forced). Runs before the
+        # logprob gather so the chosen-token logprob matches the emitted token;
+        # the top-k logprobs come from the unmodified distribution.
+        if sampling_info.forced_next_token_ids is not None:
+            forced = sampling_info.forced_next_token_ids
+            batch_next_token_ids = torch.where(
+                forced.ge(0),
+                forced.to(batch_next_token_ids.dtype),
+                batch_next_token_ids,
+            )
+
         if return_logprob:
             if target_logprobs is not None:
                 logprobs = target_logprobs
@@ -345,8 +357,12 @@ class Sampler(nn.Module):
                 )
             else:
                 assert sampling_mask_capture is not None
-                if SYNC_TOKEN_IDS_ACROSS_TP or sampling_info.grammars:
-                    # Token synchronization can replace the producer-selected token.
+                if (
+                    SYNC_TOKEN_IDS_ACROSS_TP
+                    or sampling_info.grammars
+                    or sampling_info.forced_next_token_ids is not None
+                ):
+                    # Token sync or forcing can replace the producer-selected token.
                     sampling_mask_capture = sampling_mask_capture._replace(
                         selected_weight=None
                     )

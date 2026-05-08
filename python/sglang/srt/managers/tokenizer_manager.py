@@ -1644,6 +1644,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             custom_params["thinking_budget"] = obj.max_thinking_tokens
             sampling_kwargs["custom_params"] = custom_params
         sampling_params = self.sampling_params_class(**sampling_kwargs)
+        sampling_params.resolve_forced_token_ids_path()
         sampling_params.normalize(self.tokenizer)
         sampling_params.verify(self.model_config.vocab_size)
         _validate_watermark_request(sampling_params)

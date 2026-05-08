@@ -526,6 +526,9 @@ class Envs:
     # Supersedes SGLANG_ENABLE_ASYNC_ASSERT, which is bridged as STRICT until
     # every callsite migrates.
     SGLANG_INVARIANT_CHECK = EnvInt(InvariantCheckLevel.OFF)
+    # Accept forced token ids on requests (sampling_params.FORCED_TOKEN_IDS_KEY);
+    # the path variant reads server-side files, so never expose to untrusted clients.
+    SGLANG_ENABLE_FORCED_TOKEN_IDS = EnvBool(False)
 
     # ===================================================================
     # Runtime simulations

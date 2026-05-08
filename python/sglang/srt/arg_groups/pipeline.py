@@ -9,6 +9,7 @@ from sglang.srt.arg_groups.arg_utils import record_fields
 from sglang.srt.arg_groups.kv_shard_hook import handle_kv_cache_sharding
 from sglang.srt.arg_groups.model_override_base import resolving_view
 from sglang.srt.arg_groups.overrides import (
+    _forced_token_ids_overlap_disable,
     _page_size_default,
     _pipeline_parallel_overlap_disable,
     _sampling_backend_default,
@@ -45,6 +46,9 @@ def run_resolution_pipeline(server_args: Any) -> None:
     )
 
     cfg = resolving_view(server_args)
+
+    # First, so every overlap-dependent decision below sees overlap disabled.
+    run_post_process_pass(server_args, _forced_token_ids_overlap_disable)
 
     from sglang.srt.arg_groups.validation_hook import validate_removed_options
 

@@ -914,6 +914,19 @@ def _deepseek_v4_kv_cache_dtype(view: Any) -> dict:
 
 
 @register_post_process
+def _forced_token_ids_overlap_disable(view: Any) -> dict:
+    # Forced token ids are picked by len(req.output_ids), which lags one step
+    # behind the forward under the overlap schedule.
+    if not envs.SGLANG_ENABLE_FORCED_TOKEN_IDS.get() or view.disable_overlap_schedule:
+        return {}
+    logger.warning(
+        "SGLANG_ENABLE_FORCED_TOKEN_IDS=1 forces --disable-overlap-schedule "
+        "(the forced-token step counter is incompatible with overlap mode)."
+    )
+    return {"disable_overlap_schedule": True}
+
+
+@register_post_process
 def _sparse_head_overlap_disable(view: Any) -> dict:
 
     if envs.SGLANG_EMBEDDINGS_SPARSE_HEAD.is_set():

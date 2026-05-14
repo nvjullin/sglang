@@ -113,6 +113,7 @@ class BreakableCudaGraphRunner:
         self.attention_layers = model_runner.attention_layers
         self.moe_layers = model_runner.moe_layers
         self.moe_fusions = model_runner.moe_fusions
+        self.nsa_indexers = getattr(model_runner, "nsa_indexers", None)
 
         # Resolve the inner transformer-stack module (the same boundary PCG draws
         # via patch_model). At replay we monkey-patch this module's forward with
@@ -216,6 +217,7 @@ class BreakableCudaGraphRunner:
             self.quant_config,
             self.moe_layers,
             self.moe_fusions,
+            nsa_indexers=self.nsa_indexers,
         ):
             output = self.layer_model.forward(
                 forward_batch.input_ids,
@@ -405,6 +407,7 @@ class BreakableCudaGraphRunner:
                     self.quant_config,
                     self.moe_layers,
                     self.moe_fusions,
+                    nsa_indexers=self.nsa_indexers,
                 ):
                     output = self.model_runner.model.forward(
                         static_forward_batch.input_ids,

@@ -26,6 +26,12 @@ from sglang.srt.layers.dp_attention import attn_tp_all_gather_into_tensor
 from sglang.srt.layers.layernorm import LayerNorm
 from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
 from sglang.srt.layers.utils import MultiPlatformOp
+from sglang.srt.model_executor.breakable_cuda_graph.breakable_cuda_graph import (
+    eager_on_graph,
+)
+from sglang.srt.model_executor.breakable_cuda_graph.context import (
+    is_in_breakable_cuda_graph,
+)
 from sglang.srt.state_capturer.indexer_topk import (
     maybe_capture_indexer_topk,
 )
@@ -141,6 +147,8 @@ if _is_cuda:
             metadata,
             topk_result,
         )
+
+    bcg_k_cache_and_topk_result = eager_on_graph(True)(k_cache_and_topk_result)
 
     def _logits_head_gate_pcg_fake_impl(
         x: torch.Tensor,
@@ -969,8 +977,8 @@ class Indexer(MultiPlatformOp):
         cp_index: List[Tuple[int, int, int]] = None,
     ) -> torch.Tensor:
         assert (
-            not is_in_piecewise_cuda_graph()
-        ), "DSA context parallel (_get_topk_ragged_with_cp) not supported under piecewise CUDA graph"
+            not is_in_piecewise_cuda_graph() and not is_in_breakable_cuda_graph()
+        ), "DSA context parallel (_get_topk_ragged_with_cp) not supported under piecewise/breakable CUDA graph"
         if TYPE_CHECKING:
             assert isinstance(get_token_to_kv_pool(), DSATokenToKVPool)
 
@@ -1118,8 +1126,8 @@ class Indexer(MultiPlatformOp):
         layer_id: int,
     ) -> Optional[torch.Tensor]:
         assert (
-            not is_in_piecewise_cuda_graph()
-        ), "DSA forward_indexer (non-CUDA loop path) not supported under piecewise CUDA graph"
+            not is_in_piecewise_cuda_graph() and not is_in_breakable_cuda_graph()
+        ), "DSA forward_indexer (non-CUDA loop path) not supported under piecewise/breakable CUDA graph"
         if not _is_npu:
             from sglang.srt.layers.attention.dsa.tilelang_kernel import fp8_index
 
@@ -1309,10 +1317,10 @@ class Indexer(MultiPlatformOp):
         # a tuple like (x_fp8, x_scale[, y]). Use `x_meta` for shape/device queries.
         x_meta = x[0] if isinstance(x, tuple) else x
 
-        # In piecewise CUDA graph mode, metadata is fetched inside custom ops via get_forward_context() to
+        # In piecewise/breakable CUDA graph mode, metadata is fetched inside custom ops via get_forward_context() to
         # prevent Dynamo from guarding on forward_metadata identity (which changes each
         # replay when init_forward_metadata creates a new ForwardMetadata object).
-        if not is_in_piecewise_cuda_graph():
+        if not is_in_piecewise_cuda_graph() and not is_in_breakable_cuda_graph():
             metadata = get_attn_backend().get_indexer_metadata(layer_id, forward_batch)
             if metadata is None:
                 return None
@@ -1331,6 +1339,7 @@ class Indexer(MultiPlatformOp):
         skip_logits_computation = False
         if (
             not is_in_piecewise_cuda_graph()
+            and not is_in_breakable_cuda_graph()
             and forward_batch.forward_mode.is_extend_without_speculative()
         ):
             if forward_batch.seq_lens_cpu is not None:
@@ -1387,7 +1396,7 @@ class Indexer(MultiPlatformOp):
                         act_quant=act_quant,
                     )
                 current_stream.wait_stream(self.alt_stream)
-            elif not is_in_piecewise_cuda_graph():
+            elif not is_in_piecewise_cuda_graph() and not is_in_breakable_cuda_graph():
                 q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
                 self._store_index_k_cache(
                     forward_batch=forward_batch,
@@ -1396,8 +1405,8 @@ class Indexer(MultiPlatformOp):
                     act_quant=act_quant,
                 )
             else:
-                # piecewise CUDA graph need to split graph on store_k_cache and mqa_logits,
-                # so delay store_k_cache after weights proj.
+                # piecewise/breakable CUDA graph need to split graph on store_k_cache and
+                # mqa_logits, so delay store_k_cache after weights proj.
                 q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
 
             # aiter (ROCm gfx95): the 3-tuple (fp8, scale, bf16) from
@@ -1441,7 +1450,7 @@ class Indexer(MultiPlatformOp):
             else:
                 x_for_gate = x
 
-            if is_in_piecewise_cuda_graph():
+            if is_in_piecewise_cuda_graph() or is_in_breakable_cuda_graph():
                 weights = logits_head_gate_pcg(
                     x_for_gate,
                     self.weights_proj.weight,
@@ -1453,9 +1462,9 @@ class Indexer(MultiPlatformOp):
                 weights = self._get_logits_head_gate(x_for_gate, q_scale)
 
         if _is_cuda or _is_hip:
-            # In piecewise CUDA graph, any access to seq_lens_cpu creates a Dynamo shape guard.
-            # Piecewise CUDA graph never has empty batches.
-            if not is_in_piecewise_cuda_graph():
+            # In piecewise/breakable CUDA graph, any access to seq_lens_cpu creates a Dynamo shape guard.
+            # Piecewise/breakable CUDA graph never has empty batches.
+            if not is_in_piecewise_cuda_graph() and not is_in_breakable_cuda_graph():
                 assert forward_batch.seq_lens_cpu is not None
                 if len(forward_batch.seq_lens_cpu) == 0:
                     # this seems b/c max-pad, no worries?
@@ -1526,10 +1535,10 @@ class Indexer(MultiPlatformOp):
                     topk_result = torch.cat([topk_result_prev, topk_result_next], dim=0)
                     topk_result = _broadcast_indexer_topk_from_rank0(topk_result)
                     return maybe_capture_indexer_topk(layer_id, topk_result)
-                elif is_in_piecewise_cuda_graph():
+                elif is_in_piecewise_cuda_graph() or is_in_breakable_cuda_graph():
                     assert (
                         not enable_dual_stream
-                    ), "Internal error: piecewise CUDA graph should not be enabled with dual stream"
+                    ), "Internal error: piecewise/breakable CUDA graph should not be enabled with dual stream"
 
                     topk_result = torch.full(
                         (q_fp8.shape[0], self.index_topk),
@@ -1537,7 +1546,12 @@ class Indexer(MultiPlatformOp):
                         device=q_fp8.device,
                         dtype=torch.int32,
                     )
-                    k_cache_and_topk_result(
+                    fn = (
+                        bcg_k_cache_and_topk_result
+                        if is_in_breakable_cuda_graph()
+                        else k_cache_and_topk_result
+                    )
+                    fn(
                         layer_id=layer_id,
                         key=key,
                         q_fp8=q_fp8,

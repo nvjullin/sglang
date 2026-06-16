@@ -568,6 +568,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Init forward stream for overlap schedule
         self.forward_stream = torch.get_device_module(self.device).Stream()
 
+        # WAR fine-grained barrier: a forward records this after reading the
+        # shared buffers (req_to_token / SWA mapping); the scheduler waits on it.
+        self.shared_buf_read_done_event = torch.get_device_module(self.device).Event()
+        self.shared_buf_read_done_fresh = False
+
         # CPU offload
         set_offloader(create_offloader_from_server_args(server_args, dp_rank=dp_rank))
 

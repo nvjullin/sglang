@@ -1058,6 +1058,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         )
         with timer_ctx, self.backend.replay_session():
             self.replay_prepare(forward_batch, pp_proxy_tensors)
+            # req_to_token / SWA-mapping reads are done after replay_prepare.
+            self.model_runner.shared_buf_read_done_event.record()
+            self.model_runner.shared_buf_read_done_fresh = True
             output = self.backend.replay(self._replay_graph_key, forward_batch)
 
         if isinstance(output, LogitsProcessorOutput):

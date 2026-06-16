@@ -1464,8 +1464,23 @@ class Scheduler(
         self._war_barrier_enabled = (
             is_cuda() or envs.SGLANG_ENABLE_WAR_BARRIER.get()
         ) and not self.spec_algorithm.is_dflash()
+        self._war_barrier_runner = self.tp_worker.model_runner
         with self.device_module.StreamContext(self.schedule_stream):
             dispatch_event_loop(self)
+
+    def _apply_war_barrier(self):
+        # This iter's schedule writes to shared GPU buffers wait for the prev
+        # forward's reads. Fast path (non-spec decode cuda-graph): wait on the
+        # read-done event recorded after replay_prepare so the forward's compute
+        # overlaps prep. Else fall back to the whole-forward wait_stream.
+        if not self._war_barrier_enabled:
+            return
+        mr = self._war_barrier_runner
+        if self.spec_algorithm.is_none() and mr.shared_buf_read_done_fresh:
+            self.schedule_stream.wait_event(mr.shared_buf_read_done_event)
+            mr.shared_buf_read_done_fresh = False
+        else:
+            self.schedule_stream.wait_stream(self.forward_stream)
 
     @DynamicGradMode()
     def event_loop_normal(self):
@@ -1513,9 +1528,7 @@ class Scheduler(
             if self._engine_paused:
                 continue
 
-            # WAR barrier: this iter's schedule writes to shared GPU buffers wait for prev forward's reads.
-            if self._war_barrier_enabled:
-                self.schedule_stream.wait_stream(self.forward_stream)
+            self._apply_war_barrier()
 
             # Get the next batch to run
             batch = self.get_next_batch_to_run()

@@ -1169,6 +1169,9 @@ class CudaGraphRunner:
 
         if forward_batch.needs_forward_metadata_init():
             self.replay_prepare(forward_batch, pp_proxy_tensors)
+            # req_to_token / SWA-mapping reads are done after replay_prepare.
+            self.model_runner.shared_buf_read_done_event.record()
+            self.model_runner.shared_buf_read_done_fresh = True
         else:
             # Pre-planned (plan-stream replay_prepare already ran).
             # In speculative decoding, these two fields are still needed.

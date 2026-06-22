@@ -130,18 +130,6 @@ class FutureMap:
         self.new_seq_lens_buf = torch.empty(
             (self.req_pool_size,), dtype=torch.int64, device=self.device
         )
-        # Pinned host copy of new_seq_lens_buf + private stream for fwd-prepare
-        # D2H pulls (gated only on publish, off the schedule stream). CUDA-only:
-        # recovers occupancy lost to the WAR barrier (also CUDA-only); other
-        # platforms have no barrier and use the plain .cpu() bootstrap path.
-        if _is_cuda:
-            self.new_seq_lens_cpu_pinned = torch.empty(
-                (self.req_pool_size,), dtype=torch.int64, pin_memory=True
-            )
-            self.fwd_prepare_d2h_stream = torch.get_device_module(self.device).Stream()
-        else:
-            self.new_seq_lens_cpu_pinned = None
-            self.fwd_prepare_d2h_stream = None
         if self.spec_algo.is_some():
             self._forward_buf_initialized = False
 
@@ -287,20 +275,7 @@ class FutureMap:
             batch.seq_lens_sum = None
             return
 
-        if self.fwd_prepare_d2h_stream is None or self.publish_ready is None:
-            batch.seq_lens_cpu = batch.seq_lens.cpu()  # bootstrap / non-CUDA
-            batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
-            return
-
-        # Mechanism: don't sync the schedule stream; gate a private stream on the
-        # publish event and copy into the static pinned buffer.
-        self.fwd_prepare_d2h_stream.wait_event(self.publish_ready)
-        with torch.get_device_module(self.device).stream(self.fwd_prepare_d2h_stream):
-            self.new_seq_lens_cpu_pinned.copy_(self.new_seq_lens_buf, non_blocking=True)
-        self.fwd_prepare_d2h_stream.synchronize()
-
-        # FIXME: fi == batch.req_pool_indices; unify future_indices and req_pool_indices.
-        batch.seq_lens_cpu = self.new_seq_lens_cpu_pinned[batch.req_pool_indices_cpu]
+        batch.seq_lens_cpu = batch.seq_lens.cpu()
         batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
 
     def publish(self, future_indices: torch.Tensor, new_seq_lens: torch.Tensor) -> None:

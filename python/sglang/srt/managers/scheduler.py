@@ -271,6 +271,7 @@ from sglang.srt.managers.utils import (
     validate_input_length,
 )
 from sglang.srt.mem_cache import kv_cache_builder
+from sglang.srt.mem_cache.cache_trace import TRACE as _CT
 from sglang.srt.mem_cache.common import (
     maybe_cache_unfinished_req,
     release_kv_cache,
@@ -3085,6 +3086,20 @@ class Scheduler(
     def get_next_batch_to_run(
         self, running_batch: ScheduleBatch, last_batch: Optional[ScheduleBatch]
     ) -> NextBatchPlan:
+        # Only non-idle iterations: the event loop spins here thousands of times a
+        # second with nothing to schedule, and those records would dwarf the ones
+        # that describe cache work.
+        if _CT.on and (
+            self.waiting_queue
+            or not running_batch.is_empty()
+            or self.chunked_req is not None
+        ):
+            _CT.emit(
+                "LOOP",
+                f"run_bs={running_batch.batch_size()} "
+                f"queue={len(self.waiting_queue)} "
+                f"chunked={int(self.chunked_req is not None)}",
+            )
         self.process_pending_chunked_abort()
 
         if self.enable_fpm:
@@ -3721,6 +3736,15 @@ class Scheduler(
         """Run a batch."""
         self.forward_ct += 1
         batch.forward_iter = self.forward_ct
+        if _CT.on:
+            _CT.set_batch(batch.batch_size(), self.forward_ct)
+            _CT.emit(
+                "BATCH",
+                f"mode={batch.forward_mode} bs={batch.batch_size()} reqs="
+                + ",".join(
+                    f"{r.rid}:{r.seqlen}:{len(r.prefix_indices)}" for r in batch.reqs
+                ),
+            )
         batch.launch_ts = time.monotonic()
         batch.after_idle_gap = self._sched_idled
         self._sched_idled = False

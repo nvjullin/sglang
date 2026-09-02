@@ -57,6 +57,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     zero_match_result,
 )
+from sglang.srt.mem_cache.cache_trace import TRACE as _CT
 from sglang.srt.mem_cache.multi_ended_allocator import (
     UnifiedMambaTokenToKVPoolAllocator,
 )
@@ -1208,6 +1209,17 @@ class PrefillAdder:
     def add_one_req(
         self, req: Req, has_chunked_req: bool, truncation_align_size: Optional[int]
     ):
+        if _CT.on:
+            # Ambient request context for every cache event raised while this
+            # request is being admitted (match, load-back, and the eviction the
+            # allocator triggers on its behalf).
+            _CT.set_req(req.rid, req.seqlen)
+            _CT.emit(
+                "ADMIT",
+                f"plen={len(req.prefix_indices)} host_hit={req.host_hit_length} "
+                f"fill={len(req.full_untruncated_fill_ids)} "
+                f"rem_total={self.rem_total_tokens} cur_rem={self.cur_rem_tokens}",
+            )
         # TODO support cp with multiple requests
         # Enabling context parallelism currently presents precision issues;
         # therefore, the prefill-batch setting is temporarily set to 1.

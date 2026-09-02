@@ -78,6 +78,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     zero_match_result,
 )
+from sglang.srt.mem_cache.cache_trace import TRACE as _CT
 from sglang.srt.mem_cache.capacity import capacity_decision, create_prefill_budget
 from sglang.srt.mem_cache.common import match_kv_cache, touch_waiting_prefix
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
@@ -2101,6 +2102,18 @@ class PrefillAdder:
     def add_one_req(
         self, req: Req, has_chunked_req: bool, truncation_align_size: Optional[int]
     ):
+        if _CT.on:
+            # Ambient request context for every cache event raised while this
+            # request is being admitted (match, load-back, and the eviction the
+            # allocator triggers on its behalf).
+            _CT.set_req(req.rid, req.seqlen)
+            _CT.emit(
+                "ADMIT",
+                f"plen={req.prefix_len} host_hit={req.host_hit_length} "
+                f"fill={len(req.full_untruncated_fill_ids)} "
+                f"rem_total={self.rem_total_tokens} cur_rem={self.cur_rem_tokens}",
+            )
+
         if (x := self.prefill_max_requests) is not None and len(self.can_run_list) >= x:
             return AddReqResult.OTHER
 

@@ -52,6 +52,8 @@ from sglang.srt.mem_cache.buffer_mode.storage_existence_cache import (
     StorageExistenceCache,
     default_belief_policy,
 )
+from sglang.srt.mem_cache.cache_trace import TRACE as _CT
+from sglang.srt.mem_cache.cache_trace import node_flags as _nf
 from sglang.srt.mem_cache.common import RetractionBackup
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
@@ -361,6 +363,7 @@ class UnifiedRadixCache(BasePrefixCache):
             f"Init Unified Radix Cache. Components: {self.tree_components}. "
             f"Tree Core: {type(self.tree_core).__name__}"
         )
+        _CT.attach(self)
 
     def _all_reduce_attn_groups(self, tensor: torch.Tensor, op):
         reduced = False
@@ -598,6 +601,8 @@ class UnifiedRadixCache(BasePrefixCache):
         # Runtime attach/detach of the L3 backend (startup, admin API, atexit).
         atexit.register(self.shutdown)
 
+        _CT.bind_host(self)
+
         if storage_backend is not None:
             self._storage_attachment.apply_runtime_config(
                 storage_backend=storage_backend,
@@ -648,6 +653,14 @@ class UnifiedRadixCache(BasePrefixCache):
         assert not result.cache_actions
         if self.linker is not None and params.req is not None:
             result = self.linker.match(params.key, params.req, result)
+        if _CT.on:
+            _CT.emit(
+                "MATCH",
+                f"klen={len(params.key)} dev={len(result.device_indices)} "
+                f"host={result.host_hit_length} fullkv={result.full_kv_hit_length} "
+                f"ldn={result.last_device_node} bmn={result.best_match_node} "
+                f"lhn={result.last_host_node}",
+            )
         return result
 
     def supports_fast_match_prefix(self) -> bool:
@@ -682,6 +695,17 @@ class UnifiedRadixCache(BasePrefixCache):
                 if step.result is not None:
                     # Walk actions flow through the steps; the result is action-free.
                     assert not step.result.cache_actions
+                    if _CT.on:
+                        _CT.emit(
+                            "INS",
+                            f"klen={0 if params.key is None else len(params.key)} "
+                            f"vlen={0 if params.value is None else len(params.value)} "
+                            f"prefix={step.result.prefix_len} "
+                            f"total={step.result.total_len} "
+                            f"prev={params.prev_prefix_len} "
+                            f"chunked={int(params.chunked)} "
+                            f"ldn={step.result.last_device_node}",
+                        )
                     return step.result
                 step = self.tree_core.resume_insert()
         finally:
@@ -821,12 +845,19 @@ class UnifiedRadixCache(BasePrefixCache):
         tracker = {ct: 0 for ct in self.tree_components}
 
         request_by_type = self._evict_request_by_type(params)
+        if _CT.on:
+            _CT.emit("EVICT_BEGIN", f"want={params.num_tokens}")
         self._evict_components(
             request_by_type,
             tracker,
             available_size_targets=available_size_targets,
             allocation_reclaim_satisfied=allocation_reclaim_satisfied,
         )
+        if _CT.on:
+            _CT.emit(
+                "EVICT_END",
+                f"want={params.num_tokens} got={tracker[BASE_COMPONENT_TYPE]}",
+            )
 
         if (
             self.cache_controller is not None
@@ -911,6 +942,7 @@ class UnifiedRadixCache(BasePrefixCache):
     ) -> Optional[BackupKV]:
         """Evict one device leaf, consuming its step result; returns the
         deferred write-back BackupKV when one must run before the demote."""
+        pre = _nf(self.tree_core.node_by_id(node_id)) if _CT.on else ""
         result = self.tree_core.evict_device_leaf(node_id, self.is_write_back)
         self._free_values(result.device_frees, result.host_frees)
         if self._tracks_write_through_unbacked_evictions():
@@ -919,6 +951,12 @@ class UnifiedRadixCache(BasePrefixCache):
                 reason="write_through_unbacked_eviction",
             )
         self._accumulate_tracker(tracker, result.tracker)
+        if _CT.on:
+            _CT.emit(
+                "EVD_LEAF",
+                f"n={node_id} freed={result.tracker.get(BASE_COMPONENT_TYPE, 0)} "
+                f"deferred_backup={int(result.backup_kv is not None)} {pre}",
+            )
         return result.backup_kv
 
     def _demote(self, node_id: NodeId, tracker: dict[ComponentType, int]) -> None:
@@ -926,6 +964,11 @@ class UnifiedRadixCache(BasePrefixCache):
         result = self.tree_core.demote(node_id)
         self._free_values(result.device_frees, result.host_frees)
         self._accumulate_tracker(tracker, result.tracker)
+        if _CT.on:
+            _CT.emit(
+                "DEMOTE",
+                f"n={node_id} freed={result.tracker.get(BASE_COMPONENT_TYPE, 0)}",
+            )
 
     def _drop_subtree_no_host(
         self, node_id: NodeId, tracker: dict[ComponentType, int]
@@ -938,6 +981,12 @@ class UnifiedRadixCache(BasePrefixCache):
                 result.tracker.get(BASE_COMPONENT_TYPE, 0), reason="host_pressure"
             )
         self._accumulate_tracker(tracker, result.tracker)
+        if _CT.on:
+            _CT.emit(
+                "DROP_SUBTREE",
+                f"n={node_id} dropped={int(result.is_dropped)} "
+                f"freed={result.tracker.get(BASE_COMPONENT_TYPE, 0)}",
+            )
         return result.is_dropped
 
     def _evict_components(
@@ -1130,6 +1179,13 @@ class UnifiedRadixCache(BasePrefixCache):
         self.session.take(req)
 
     def claim_kv_row(self, req: Req) -> bool:
+        if _CT.on:
+            _CT.set_req(req.rid, req.seqlen)
+            _CT.emit(
+                "REQ_FIN",
+                f"finished={int(req.finished())} "
+                f"plen={len(req.prefix_indices)} cpl={req.kv.cache_protected_len}",
+            )
         # Retraction also enters here: retain its ticket until actual finish.
         if (
             self.cache_controller is not None
@@ -1148,6 +1204,13 @@ class UnifiedRadixCache(BasePrefixCache):
 
     @rank_consensus(same_params=["req.rid", "up_to"])
     def checkpoint(self, req: Req, *, up_to: int, **kwargs) -> None:
+        if _CT.on:
+            _CT.set_req(req.rid, req.seqlen)
+            _CT.emit(
+                "REQ_UNFIN",
+                f"upto={up_to} plen={len(req.prefix_indices)} "
+                f"cpl={req.kv.cache_protected_len}",
+            )
         if self.session.try_checkpoint(req, up_to=up_to, **kwargs):
             return
         self.checkpoint_into_tree(req, up_to=up_to, **kwargs)
@@ -1395,8 +1458,12 @@ class UnifiedRadixCache(BasePrefixCache):
             self.components[action.component_type].apply_component_action(action)
         elif isinstance(action, FreeDeviceKV):
             # tree values are page-aligned copies of a kv row: page-exact segments
+            freed = 0
             for indices in action.indices:
+                freed += len(indices)
                 self.token_to_kv_pool_allocator.free_segment(indices, start_pos=0)
+            if _CT.on:
+                _CT.emit("FREE_DEV", f"tok={freed} nseg={len(action.indices)}")
         elif isinstance(action, FreeDeviceKVFullOnly):
             for indices in action.indices:
                 self.token_to_kv_pool_allocator.free_full_segment(indices, start_pos=0)
@@ -1434,7 +1501,12 @@ class UnifiedRadixCache(BasePrefixCache):
             return 0
         result = self.tree_core.drive_host_eviction(component_type, num_tokens)
         self._free_values(result.device_frees, result.host_frees)
-        return result.tracker.get(component_type, 0)
+        got = result.tracker.get(component_type, 0)
+        if _CT.on:
+            _CT.emit(
+                "EVICT_HOST", f"ct={int(component_type)} want={num_tokens} got={got}"
+            )
+        return got
 
     # ---- Decode retraction ----
 
@@ -1684,6 +1756,11 @@ class UnifiedRadixCache(BasePrefixCache):
             for node_id in action.node_ids:
                 self.buffer_pipeline.enqueue_backup_intent(node_id)
             return 0
+        if _CT.on:
+            _CT.emit(
+                "BACKUP_ACT",
+                f"wb={int(write_back)} nodes={','.join(str(i) for i in action.node_ids)}",
+            )
         written = 0
         for node_id in action.node_ids:
             device_value, comp_xfers = self.tree_core.build_backup_spec(node_id)
@@ -1731,22 +1808,40 @@ class UnifiedRadixCache(BasePrefixCache):
     def _execute_kv_backup(self, node_id, device_value, comp_xfers, sidecar_xfers):
         """Execute Backup action."""
         kv_tokens = len(device_value)
+        host_evicted = -1
         anchor_entry = self.cache_controller.mem_pool_host.anchor_entry
+        host_avail = self.cache_controller.mem_pool_host.available_size()
         if (
             anchor_entry.host_pool.shared_allocation_domain is None
             or anchor_entry.host_evict_fn is None
         ):
-            host_avail = self.cache_controller.mem_pool_host.available_size()
             if host_avail < kv_tokens:
                 needed = kv_tokens - host_avail
-                if self.evict_host(needed) < needed:
+                host_evicted = self.evict_host(needed)
+                if host_evicted < needed:
+                    if _CT.on:
+                        _CT.emit(
+                            "D2H",
+                            f"n={node_id} tok={kv_tokens} host_avail={host_avail} "
+                            f"host_evicted={host_evicted} need={needed} ok=0 hlen=-1",
+                        )
                     return None
         aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
         aux_xfers.extend(sidecar_xfers)
         # Defer submission so the next flush can merge pending node backups.
-        return self.cache_controller.write(
+        host_indices = self.cache_controller.write(
             device_value, node_id=node_id, extra_pools=aux_xfers or None, flush=False
         )
+        if _CT.on:
+            _CT.emit(
+                "D2H",
+                f"n={node_id} tok={kv_tokens} host_avail={host_avail} "
+                f"host_evicted={host_evicted} need=0 "
+                f"ok={int(host_indices is not None)} "
+                f"hlen={-1 if host_indices is None else len(host_indices)} "
+                f"aux={len(aux_xfers)}",
+            )
+        return host_indices
 
     def _track_write_through_node(
         self,
@@ -1795,6 +1890,11 @@ class UnifiedRadixCache(BasePrefixCache):
         lock_node_id, lock_params, publish_node_ids = self.ongoing_write_through.pop(
             ack_id
         )
+        if _CT.on:
+            _CT.emit(
+                "D2H_ACK",
+                f"ack={ack_id} nodes={','.join(str(i) for i in publish_node_ids)}",
+            )
         self.tree_core.finish_write_through(publish_node_ids, ack_id)
         if lock_params is not None:
             self.dec_lock_ref(lock_node_id, lock_params)
@@ -1827,6 +1927,12 @@ class UnifiedRadixCache(BasePrefixCache):
             for comp in self._components_tuple
         }
         success = False
+        if _CT.on:
+            _CT.emit(
+                "H2D_BEGIN",
+                f"n={node_id} quota={mem_quota} delta={result.delta} "
+                f"{_nf(self.tree_core.node_by_id(node_id))}",
+            )
         try:
             success = self._load_back_transfers(
                 node_id=node_id,
@@ -1840,6 +1946,8 @@ class UnifiedRadixCache(BasePrefixCache):
         finally:
             for comp in self._components_tuple:
                 comp.finalize_load_back(req, preps[comp.component_type], success)
+            if _CT.on:
+                _CT.emit("H2D_END", f"n={node_id} ok={int(success)}")
 
     def _load_back_transfers(
         self,
@@ -1854,6 +1962,13 @@ class UnifiedRadixCache(BasePrefixCache):
         # Build the KV + per-component aux transfers.
         kv_xfer, comp_xfers = self.tree_core.build_load_back_spec(node_id, req=req)
         kv_tokens = len(kv_xfer.host_indices)
+        if _CT.on:
+            _CT.emit(
+                "H2D_SPEC",
+                f"n={node_id} tok={kv_tokens} quota={mem_quota} "
+                f"delta={result.delta} thr={self.load_back_threshold} "
+                f"srcs={len(kv_xfer.nodes_to_load or ())}",
+            )
         sidecar_xfers = self._build_sidecar_transfers(
             CacheTransferPhase.LOAD_BACK, kv_xfer, comp_xfers
         )

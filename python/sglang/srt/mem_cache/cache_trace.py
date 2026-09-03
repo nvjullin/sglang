@@ -62,6 +62,7 @@ _DEPTH = int(os.environ.get("SGLANG_CACHE_TRACE_DEPTH", "14"))
 _GZIP = os.environ.get("SGLANG_CACHE_TRACE_GZIP", "1") not in ("0", "", "false")
 _MAX_BYTES = int(os.environ.get("SGLANG_CACHE_TRACE_MAX_BYTES", str(4 << 30)))
 _FLUSH_EVERY = int(os.environ.get("SGLANG_CACHE_TRACE_FLUSH_EVERY", "1000"))
+_NVTX = os.environ.get("SGLANG_CACHE_TRACE_NVTX", "0") not in ("0", "", "false", "False")
 _MAX_ERRORS = 20
 
 
@@ -69,6 +70,102 @@ def _frame_label(code, lineno: int) -> str:
     path = code.co_filename
     cut = path.rfind("/")
     return f"{path[cut + 1:]}:{code.co_name}:{lineno}"
+
+
+class _NvtxMirror:
+    """Mirror trace records onto an Nsight Systems timeline (``SGLANG_CACHE_TRACE_NVTX=1``).
+
+    A capture says which copies ran and when; this trace says which node moved and why.
+    The two are written in different clocks, so pairing them afterwards means aligning two
+    timebases by hand. Emitting each record as an NVTX marker from the same process puts
+    both on one timeline instead, which is the point of running the tracer and the profiler
+    together at all.
+
+    Begin/end records additionally open a range, so a host-to-device load-back reads as one
+    bar spanning the copies it issued rather than as two unrelated points. The range is
+    process-scoped (``nvtxRangeStartA`` / ``nvtxRangeEnd``) rather than the thread-stacked
+    push/pop pair, because these events interleave across threads and do not nest.
+
+    Nothing here raises into the tracer: the first failure disables the mirror and leaves
+    the file stream untouched.
+    """
+
+    # Opening record -> range name. Both records of a pair open their detail field with the
+    # same token -- ``n=<node>`` for the transfer pair, ``want=<tokens>`` for the two
+    # reclaim pairs -- which is what an open range is keyed on.
+    _BEGINS = {"H2D_BEGIN": "H2D", "EVICT_BEGIN": "EVICT", "RECLAIM_RUN": "RECLAIM"}
+    _ENDS = {"H2D_END": "H2D", "EVICT_END": "EVICT", "RECLAIM_DONE": "RECLAIM"}
+    # Detail fields run to a few hundred characters; a span name that long is unreadable on
+    # a timeline, and the full record is in the file anyway.
+    _MAX_DETAIL = 120
+
+    def __init__(self) -> None:
+        self.on = False
+        self._mark = None
+        self._start = None
+        self._stop = None
+        self._open: dict[tuple, int] = {}
+
+    def enable(self) -> None:
+        if not (_ENABLED and _NVTX):
+            return
+        try:
+            # Bound off torch's raw bindings rather than the torch.cuda.nvtx wrappers,
+            # which run msg.format() on the span name and so raise on any brace in a
+            # detail field.
+            from torch._C import _nvtx
+
+            self._mark = _nvtx.markA
+            self._start = getattr(_nvtx, "rangeStartA", None)
+            self._stop = getattr(_nvtx, "rangeEnd", None)
+        except Exception:
+            logger.warning(
+                "SGLANG_CACHE_TRACE_NVTX=1 but torch's NVTX bindings are unavailable; "
+                "cache events will not reach the profiler timeline."
+            )
+            return
+        if self._start is None or self._stop is None:
+            logger.warning(
+                "SGLANG_CACHE_TRACE_NVTX=1: torch exposes no NVTX start/end range; "
+                "emitting markers only, so transfers appear as points rather than bars."
+            )
+            self._start = self._stop = None
+        self.on = True
+
+    def mirror(self, event: str, detail: str) -> None:
+        try:
+            short = detail[: self._MAX_DETAIL]
+            self._mark(f"ct.{event} {short}" if short else f"ct.{event}")
+            if self._start is None:
+                return
+            key = detail.split(" ", 1)[0]
+            name = self._BEGINS.get(event)
+            if name is not None:
+                slot = (name, key)
+                prior = self._open.pop(slot, None)
+                if prior is not None:
+                    self._stop(prior)  # an opener that never closed; do not leak it
+                self._open[slot] = self._start(f"ct.{name} {short}")
+                return
+            name = self._ENDS.get(event)
+            if name is not None:
+                prior = self._open.pop((name, key), None)
+                if prior is not None:
+                    self._stop(prior)
+        except Exception:
+            self.on = False
+
+    def close(self) -> None:
+        """End ranges still open, so none is drawn running to the end of the capture."""
+        if not self.on:
+            return
+        self.on = False
+        try:
+            for handle in self._open.values():
+                self._stop(handle)
+        except Exception:
+            pass
+        self._open.clear()
 
 
 class _Tracer:
@@ -198,6 +295,7 @@ class _Tracer:
             self._note_error("bind_host")
 
     def close(self) -> None:
+        _NVTX_MIRROR.close()
         if self._fh is None:
             return
         self.on = False
@@ -301,6 +399,10 @@ class _Tracer:
     def emit(self, event: str, detail: str = "") -> None:
         if not self.on:
             return
+        # Ahead of the file write: the pool reads and stack hash below cost tens of
+        # microseconds, and a marker is only useful if it lands where the event did.
+        if _NVTX_MIRROR.on:
+            _NVTX_MIRROR.mirror(event, detail)
         try:
             if self._fh is None:
                 self._open()
@@ -334,6 +436,8 @@ class _Tracer:
 
 TRACE = _Tracer()
 TRACE.on = _ENABLED
+_NVTX_MIRROR = _NvtxMirror()
+_NVTX_MIRROR.enable()
 
 
 def node_flags(node) -> str:

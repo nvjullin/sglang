@@ -35,6 +35,8 @@ class TransferKVChunk:
     wait_event: Optional[object] = None
     # Must complete before reading asynchronously copied host indices.
     indices_event: Optional[object] = None
+    # (t_enqueue, forward_ct, stack hash, queue depth) when the KV transfer trace is on.
+    trace: Optional[tuple] = None
 
 
 def bind_thread_to_device(gpu_id: int) -> None:
@@ -100,6 +102,9 @@ class FastQueue:
             self._buf.append(item)
             # wake up a thread of wait()
             self._cond.notify()
+
+    def __len__(self) -> int:
+        return len(self._buf)
 
     def get(self):
         with self._cond:

@@ -38,6 +38,8 @@ class TransferKVChunk:
     # The room's send record this chunk was counted in when queued (a
     # `SendRecord`); the worker reports the chunk finished to it only.
     send_record: Optional[object] = None
+    # (t_enqueue, forward_ct, stack hash, queue depth) when the KV transfer trace is on.
+    trace: Optional[tuple] = None
 
 
 def bind_thread_to_device(gpu_id: int) -> None:
@@ -103,6 +105,9 @@ class FastQueue:
             self._buf.append(item)
             # wake up a thread of wait()
             self._cond.notify()
+
+    def __len__(self) -> int:
+        return len(self._buf)
 
     def get(self):
         with self._cond:

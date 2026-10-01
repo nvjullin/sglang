@@ -43,6 +43,7 @@ from sglang.srt.disaggregation.common.staging_buffer import (
     compute_grid_segments,
     staging_grid_tokens,
 )
+from sglang.srt.disaggregation.kv_xfer_trace import TRACE as _KVXT
 from sglang.srt.disaggregation.utils import (
     FAKE_BOOTSTRAP_HOST,
     DisaggregationMode,
@@ -367,6 +368,13 @@ class PrefillBootstrapQueue:
                     kv_pool.page_size,
                     slot_layer_ids=slot_layer_ids,
                 )
+        if _KVXT.on and self.transfer_backend == TransferBackend.NIXL:
+            _KVXT.bind(
+                kv_manager=kv_manager,
+                role="P",
+                pools=(self.token_to_kv_pool, draft_kv_pool, self.metadata_buffers),
+                forward_ct=lambda: self.scheduler.forward_ct,
+            )
         return kv_manager
 
     def create_sender(self, req: Req, num_kv_heads: int) -> bool:
@@ -1193,9 +1201,23 @@ class SchedulerDisaggregationPrefillMixin:
                 req.disagg_kv_sender.clear()
                 done_reqs.append(req)
                 req.time_stats.set_prefill_kv_transfer_finish_time()
+                if _KVXT.on:
+                    _KVXT.retire(
+                        room=req.bootstrap_room,
+                        rid=req.rid,
+                        ok=True,
+                        sender=req.disagg_kv_sender,
+                    )
             elif poll == KVPoll.Failed:
                 self.handle_inflight_transfer_failure(req)
                 done_reqs.append(req)
+                if _KVXT.on:
+                    _KVXT.retire(
+                        room=req.bootstrap_room,
+                        rid=req.rid,
+                        ok=False,
+                        sender=req.disagg_kv_sender,
+                    )
             else:
                 raise RuntimeError(
                     f"Unexpected poll state {poll} for req {req.rid} in inflight queue"

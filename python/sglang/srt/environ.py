@@ -724,6 +724,18 @@ class Envs:
     # (supports_deferred_decode_kv_release).
     SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE = EnvBool(True)
     SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE_TIMEOUT = EnvFloat(30.0)
+    # Per-process NIXL KV-transfer trace; format in disaggregation/kv_xfer_trace.py.
+    SGLANG_KV_XFER_TRACE = EnvBool(False)
+    SGLANG_KV_XFER_TRACE_DIR = EnvStr("/logs/kvxfer")
+    SGLANG_KV_XFER_TRACE_DEPTH = EnvInt(16)
+    # Trace rooms with room % SAMPLE == 0; P and D agree, so sampled rooms still join.
+    SGLANG_KV_XFER_TRACE_SAMPLE = EnvInt(1)
+    # Full run-length index lists for traced rooms with room % IDX_EVERY == 0; 0 = off.
+    SGLANG_KV_XFER_TRACE_IDX_EVERY = EnvInt(0)
+    # Compressed bytes per process; arbitrary, sized so ~48 processes stay under 5 GB.
+    SGLANG_KV_XFER_TRACE_MAX_BYTES = EnvInt(100 << 20)
+    SGLANG_KV_XFER_TRACE_FLUSH_S = EnvFloat(2.0)
+    SGLANG_KV_XFER_TRACE_STAT_S = EnvFloat(10.0)
 
     # ===================================================================
     # Distributed and model-parallel runtime

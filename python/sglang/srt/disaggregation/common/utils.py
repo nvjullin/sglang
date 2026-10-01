@@ -34,6 +34,8 @@ class TransferKVChunk:
     staging_counted: bool = False
     # Mori early-send: CUDA event to synchronize before RDMA (optional).
     wait_event: Optional[object] = None
+    # (t_enqueue, forward_ct, stack hash, queue depth) when the KV transfer trace is on.
+    trace: Optional[tuple] = None
 
 
 def pack_list_of_buffers(buffers: List[bytes]) -> bytes:
@@ -79,6 +81,9 @@ class FastQueue:
             self._buf.append(item)
             # wake up a thread of wait()
             self._cond.notify()
+
+    def __len__(self) -> int:
+        return len(self._buf)
 
     def get(self):
         with self._cond:

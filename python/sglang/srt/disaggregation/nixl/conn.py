@@ -41,6 +41,7 @@ from sglang.srt.disaggregation.common.utils import (
     pack_int_lists,
     unpack_int_lists,
 )
+from sglang.srt.disaggregation.kv_xfer_trace import TRACE as _KVXT
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     build_dsa_tail_transfer_blocks,
@@ -368,6 +369,8 @@ class KVArgsRegisterInfo:
     dst_state_layer_ids: List[List[int]] = dataclasses.field(default_factory=list)
     dst_homogeneous_mem_kind: Optional[str] = None
     kv_xfer_segments: Optional[List[_KVXferPreparedSegment]] = None
+    # Decode entry each local KV entry lands in, for the prepped and DCP paths.
+    dst_entry_indices: Optional[List[int]] = None
     staging_base_ptr: int = 0
     staging_total_size: int = 0
     dst_state_data_lens: List[List[int]] = dataclasses.field(default_factory=list)
@@ -1028,6 +1031,8 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 parsed = self.parse_kv_status_message(msg)
                 if parsed is not None:
                     room, status, prefill_rank, reason = parsed
+                    if _KVXT.on:
+                        _KVXT.rx_status(room, status, prefill_rank, time.perf_counter())
                     self.apply_prefill_status(
                         bootstrap_room=room,
                         status=status,
@@ -1105,12 +1110,15 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         since it does not prove the write into the decode's pages is over.
         """
         deadline = time.time() + NIXL_ERR_SETTLE_TIMEOUT_S if failure_seen else None
+        trace = _KVXT.cur() if _KVXT.on else None
         while True:
             all_settled = True
             any_failed = failure_seen
             try:
                 for handle in handles:
                     state = self.agent.check_xfer_state(handle)
+                    if trace is not None:
+                        trace.observe(handle, state)
                     if state == "ERR":
                         any_failed = True
                     elif state != "DONE":
@@ -1305,6 +1313,8 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
 
         src_kv_item_len = self.kv_args.kv_item_lens[0]
         bytes_per_token_to_send = num_heads_to_send * bytes_per_head_slice
+        if _KVXT.on:
+            _KVXT.slice_desc_bytes[peer_name] = int(bytes_per_token_to_send)
         bytes_per_token_dst = dst_kv_item_len // page_size
         # One run per region below relies on tokens (and src head groups) tiling
         # a slot exactly; otherwise the runs would address the wrong bytes.
@@ -1504,6 +1514,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 n_dst,
             )
             peer_info.dcp_dst_region_indices = dst_indices
+            peer_info.dst_entry_indices = dst_indices
             dst_kv_mem_kinds = [peer_info.dst_kv_mem_kinds[j] for j in dst_indices]
             dst_kv_item_lens = [peer_info.dst_kv_item_lens[j] for j in dst_indices]
             dst_mem_kind = _homogeneous_kv_mem_kind(
@@ -1567,6 +1578,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             dst_indices = self._build_transfer_dst_indices(
                 peer_info=peer_info, n_src=n_src, n_dst=n_dst
             )
+            peer_info.dst_entry_indices = dst_indices
             dst_kv_ptrs = [peer_info.dst_kv_ptrs[j] for j in dst_indices]
             dst_kv_item_lens = [peer_info.dst_kv_item_lens[j] for j in dst_indices]
             dst_kv_data_lens = [
@@ -1611,6 +1623,11 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             handles: List[Any] = []
             settle_timed_out = False
             room_transfer_infos = None
+            trace = (
+                _KVXT.chunk_begin(kv_chunk, worker=worker_index, queue=queue)
+                if _KVXT.on
+                else None
+            )
             try:
                 if room not in self.request_status:
                     logger.debug(
@@ -1877,6 +1894,8 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 # decode's KV pages, and the failure path below tells the decode
                 # those pages are free.
                 settled, any_failed = self._await_handles(handles, failure_seen=False)
+                if trace is not None:
+                    _KVXT.chunk_settled(trace)
                 if not settled:
                     settle_timed_out = True
                     raise RuntimeError(
@@ -1885,10 +1904,14 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     )
                 if any_failed:
                     raise RuntimeError(f"NIXL transfer encountered ERR room={room}")
+                if trace is not None:
+                    trace.status = "ok"
 
                 if staging_deferred:
                     # Drain posted writes before the retry reuses this worker's
                     # packing buffers; the re-enqueued chunk stays counted.
+                    if trace is not None:
+                        trace.status = "defer"
                     continue
                 # Clear with the decrement: the failure path below reads this
                 # flag, so a raise after this point must not uncount twice.
@@ -1932,6 +1955,8 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     logger.exception(
                         f"Unexpected transfer worker error for room {room}"
                     )
+                if trace is not None:
+                    _KVXT.chunk_failed(trace, e)
                 # An exception raised while the batch was still being built
                 # leaves the handles posted so far running, so settle here too
                 # rather than only after the barrier.
@@ -1968,6 +1993,9 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 # Settle first; NIXL 1.3.0 undoes a reload when an old handle fails.
                 # room_transfer_infos survives the sender's clear() of this room.
                 self._reload_invalidated_peers(room_transfer_infos or {})
+            finally:
+                if trace is not None:
+                    _KVXT.chunk_end(trace)
 
     def register_buffer_to_engine(self):
         self.kv_descs = []
@@ -2045,6 +2073,8 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             )
             self._prepare_payload_xfer(decode_kv_args)
             self._prepare_state_xfer(decode_kv_args)
+            if _KVXT.on:
+                _KVXT.peer_added(decode_kv_args, mgr=self)
 
     def _reload_invalidated_peers(self, room_transfer_infos: Dict[str, Any]) -> None:
         # NIXL drops a peer's metadata after a remote-disconnect error and never
@@ -2111,6 +2141,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         ``force_flat`` uses the MLA-style flat (single-buffer-per-layer) layout
         even on a non-MLA backend, for K-only state buffers (e.g. MiniMax sparse
         index) whose per-layer list must not be half-split into K/V."""
+        t_post = time.perf_counter()
         # Prepped path (KV only; state transfers use the non-prepped path below).
         if (
             not bypass_prepped
@@ -2143,6 +2174,18 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             if not xfer_handle:
                 raise Exception("KVSender failed to create prepped transfer")
             self._post_xfer(xfer_handle, "KVSender failed to post prepped transfer")
+            if _KVXT.on:
+                _KVXT.posted(
+                    handle=xfer_handle,
+                    peer=peer_name,
+                    kind="kv",
+                    t0=t_post,
+                    nbytes=len(prefill_data_indices) * sum(item_lens),
+                    ndesc=len(src_indices),
+                    nent=num_layers,
+                    src=prefill_data_indices,
+                    dst=dst_data_indices,
+                )
             return xfer_handle
 
         # Non-prepped path: used for state transfers (SWA/NSA) via maybe_send_extra.
@@ -2296,6 +2339,22 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         if not xfer_handle:
             raise Exception("KVSender failed to create transfer")
         self._post_xfer(xfer_handle, "KVSender failed to post transfer")
+        if _KVXT.on:
+            if state_type is not None:
+                kind = f"st.{state_type.value}"
+            else:
+                kind = "kvd" if force_flat else "kvf"
+            _KVXT.posted(
+                handle=xfer_handle,
+                peer=peer_name,
+                kind=kind,
+                t0=t_post,
+                nbytes=int(src_reqs[:, 1].sum()),
+                ndesc=len(src_reqs),
+                nent=len(layers_params),
+                src=prefill_data_indices,
+                dst=dst_data_indices,
+            )
         return xfer_handle
 
     def send_kvcache(
@@ -2439,7 +2498,8 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             raise RuntimeError(f"Missing NIXL mixed KV transfer plan for {peer_name}")
 
         handles = []
-        for seg in segments:
+        for part_idx, seg in enumerate(segments):
+            t_post = time.perf_counter()
             num_layers = seg.end - seg.start
             src_indices = repeat_indices_over_layers(
                 prefill_kv_indices, num_layers, self._num_slots_src
@@ -2459,6 +2519,19 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             self._post_xfer(
                 xfer_handle, "KVSender failed to post mixed prepped transfer"
             )
+            if _KVXT.on:
+                _KVXT.posted(
+                    handle=xfer_handle,
+                    peer=peer_name,
+                    kind=f"kvm{part_idx}",
+                    t0=t_post,
+                    nbytes=len(prefill_kv_indices)
+                    * sum(self.kv_args.kv_item_lens[seg.start : seg.end]),
+                    ndesc=len(src_indices),
+                    nent=num_layers,
+                    src=prefill_kv_indices,
+                    dst=dst_kv_indices,
+                )
             handles.append(xfer_handle)
         return handles
 
@@ -2469,6 +2542,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         dst_kv_indices: npt.NDArray[np.int32],
     ):
         # Prepped path: src dlist is shared per decode_tp_size; dst is per peer.
+        t_post = time.perf_counter()
         assert self.prep_handle_slice_src is not None
         assert peer_name in self.prep_handles_slice_dst
         src_handle, num_groups, num_ptr_pairs, num_slots_src = (
@@ -2502,6 +2576,18 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         if not xfer_handle:
             raise Exception("KVSender failed to create prepped slice transfer")
         self._post_xfer(xfer_handle, "KVSender failed to post prepped slice transfer")
+        if _KVXT.on:
+            _KVXT.posted(
+                handle=xfer_handle,
+                peer=peer_name,
+                kind="kvs",
+                t0=t_post,
+                nbytes=len(src_indices) * _KVXT.slice_desc_bytes.get(peer_name, -1),
+                ndesc=len(src_indices),
+                nent=num_ptr_pairs,
+                src=prefill_kv_indices,
+                dst=dst_kv_indices,
+            )
         return xfer_handle
 
     def send_kvcache_staged(
@@ -2527,6 +2613,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         if self.kv_buffer_tensors is None or staging_buffer is None:
             return None
 
+        t_post = time.perf_counter()
         k_buffers = self.kv_buffer_tensors["k_buffers"]
         v_buffers = self.kv_buffer_tensors["v_buffers"]
         page_size = self.kv_buffer_tensors["page_size"]
@@ -2610,6 +2697,17 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 f"size={per_rank_bytes})"
             )
         self._post_xfer(xfer_handle, "[Staging] NIXL bulk transfer failed to post")
+        if _KVXT.on:
+            _KVXT.posted(
+                handle=xfer_handle,
+                peer=peer_name,
+                kind="stg",
+                t0=t_post,
+                nbytes=per_rank_bytes,
+                ndesc=1,
+                nent=num_layers * 2,
+                src=prefill_kv_indices,
+            )
         return xfer_handle
 
     def _try_create_staging_strategy(self, staging_buffer):
@@ -2710,6 +2808,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         dst_aux_ptrs: list[int],
         dst_aux_index: int,
     ):
+        t_post = time.perf_counter()
         src_addrs = []
         dst_addrs = []
 
@@ -2736,6 +2835,18 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         if not xfer_handle:
             raise Exception("KVSender failed to create transfer")
         self._post_xfer(xfer_handle, "KVSender failed to post transfer")
+        if _KVXT.on:
+            _KVXT.posted(
+                handle=xfer_handle,
+                peer=peer_name,
+                kind="aux",
+                t0=t_post,
+                nbytes=sum(length for _, length, _ in src_addrs),
+                ndesc=len(src_addrs),
+                nent=len(src_addrs),
+                src=prefill_aux_index,
+                dst=dst_aux_index,
+            )
         return xfer_handle
 
     def _send_slot_state(
@@ -2749,6 +2860,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         dst_indices: list[int],
         dst_gpu_id: int,
     ):
+        t_post = time.perf_counter()
         dst_data_ptrs = slice_dsa_tail_dst_ptrs_for_pp(
             src_data_ptrs,
             dst_data_ptrs,
@@ -2787,6 +2899,18 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         if not xfer_handle:
             raise Exception("KVSender failed to create dsa_tail transfer")
         self._post_xfer(xfer_handle, "KVSender failed to post dsa_tail transfer")
+        if _KVXT.on:
+            _KVXT.posted(
+                handle=xfer_handle,
+                peer=peer_name,
+                kind=f"st.{StateType.DSA_TAIL.value}",
+                t0=t_post,
+                nbytes=sum(length for _, _, length in transfer_blocks),
+                ndesc=len(transfer_blocks),
+                nent=len(src_data_ptrs),
+                src=src_indices,
+                dst=dst_indices,
+            )
         return xfer_handle
 
     def _send_mamba_state(
@@ -2802,6 +2926,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         dst_layer_ids: list[int] = None,
     ):
         """Transfer Mamba states via RDMA."""
+        t_post = time.perf_counter()
         assert len(prefill_state_indices) == 1, "Mamba should have single state index"
         assert len(dst_state_indices) == len(prefill_state_indices), (
             "State indices count mismatch between Prefill and Decode"
@@ -2839,6 +2964,18 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         if not xfer_handle:
             raise Exception("Failed to create Mamba state transfer")
         self._post_xfer(xfer_handle, "Failed to post Mamba state transfer")
+        if _KVXT.on:
+            _KVXT.posted(
+                handle=xfer_handle,
+                peer=peer_name,
+                kind=f"st.{StateType.MAMBA.value}",
+                t0=t_post,
+                nbytes=sum(length for _, length, _ in src_addrs),
+                ndesc=len(src_addrs),
+                nent=len(src_addrs),
+                src=prefill_state_indices,
+                dst=dst_state_indices,
+            )
         return xfer_handle
 
     def _send_mamba_state_slice(
@@ -2870,6 +3007,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         ``src_state_conv_shard_groups`` (see
         compute_mamba_state_slice_byte_blocks).
         """
+        t_post = time.perf_counter()
         logger.warning_once(
             "Using Mamba state slice transfer for different TP sizes. "
             f"Prefill attn_tp_size={self.state_tp_size}, "
@@ -2964,6 +3102,18 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         if not xfer_handle:
             raise Exception("Failed to create Mamba state slice transfer")
         self._post_xfer(xfer_handle, "Failed to post Mamba state slice transfer")
+        if _KVXT.on:
+            _KVXT.posted(
+                handle=xfer_handle,
+                peer=peer_name,
+                kind=f"st.{StateType.MAMBA.value}",
+                t0=t_post,
+                nbytes=sum(length for _, length, _ in src_addrs),
+                ndesc=len(src_addrs),
+                nent=len(src_addrs),
+                src=prefill_state_indices,
+                dst=dst_state_indices,
+            )
         return xfer_handle
 
     def _send_swa_state_slice(
@@ -3292,17 +3442,20 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             info.dst_port for info in self.transfer_infos[bootstrap_room].values()
         )
         shard_idx = session_port_sum % len(self.transfer_queues)
-        self.transfer_queues[shard_idx].put(
-            TransferKVChunk(
-                room=bootstrap_room,
-                prefill_kv_indices=kv_indices,
-                index_slice=index_slice,
-                is_last_chunk=is_last_chunk,
-                prefill_aux_index=aux_index,
-                state_indices=state_indices,
-                num_kv_tokens=num_kv_tokens,
-            )
+        kv_chunk = TransferKVChunk(
+            room=bootstrap_room,
+            prefill_kv_indices=kv_indices,
+            index_slice=index_slice,
+            is_last_chunk=is_last_chunk,
+            prefill_aux_index=aux_index,
+            state_indices=state_indices,
+            num_kv_tokens=num_kv_tokens,
         )
+        if _KVXT.on:
+            _KVXT.enqueued(
+                kv_chunk, shard=shard_idx, queue=self.transfer_queues[shard_idx]
+            )
+        self.transfer_queues[shard_idx].put(kv_chunk)
         return None
 
     def _handle_abort_notification(self, msg: List[bytes]) -> bool:
@@ -3411,6 +3564,12 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     )
                     logger.debug(f"{room=} is bootstrapped")
                     self.update_status(room, KVPoll.WaitingForInput)
+                    if _KVXT.on:
+                        _KVXT.room_ready(
+                            room,
+                            self.transfer_infos[room],
+                            self.req_to_decode_prefix_len[room],
+                        )
 
         def bootstrap_thread_guarded():
             try:
@@ -3531,7 +3690,42 @@ class NixlKVSender(CommonKVSender):
 
 
 class NixlKVReceiver(CommonKVReceiver):
-    pass
+    def clear(self) -> None:
+        super().clear()
+        if _KVXT.on:
+            _KVXT.rx_end(self.bootstrap_room, "clear")
+
+    def send_metadata(self, kv_indices, *args, **kwargs):
+        t_publish = time.perf_counter()
+        super().send_metadata(kv_indices, *args, **kwargs)
+        if _KVXT.on and self.conclude_state is None and self.bootstrap_infos:
+            # send_metadata(kv_indices, aux_index, state_indices, decode_prefix_len)
+            params = dict(
+                zip(("aux_index", "state_indices", "decode_prefix_len"), args)
+            )
+            params.update(kwargs)
+            _KVXT.meta_sent(
+                room=self.bootstrap_room,
+                t_publish=t_publish,
+                kv_indices=kv_indices,
+                aux_index=params.get("aux_index"),
+                state_indices=params.get("state_indices"),
+                decode_prefix_len=params.get("decode_prefix_len"),
+                targets=self.bootstrap_infos,
+                nresp=self.required_prefill_response_num,
+            )
+
+    def poll(self) -> KVPoll:
+        was_concluded = self.conclude_state is not None
+        status = super().poll()
+        if _KVXT.on and not was_concluded:
+            if status in (KVPoll.Success, KVPoll.Failed):
+                _KVXT.rx_end(
+                    self.bootstrap_room, "ok" if status == KVPoll.Success else "fail"
+                )
+            else:
+                _KVXT.rx_poll(self.bootstrap_room)
+        return status
 
 
 class NixlKVBootstrapServer(CommonKVBootstrapServer):

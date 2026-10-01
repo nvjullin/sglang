@@ -53,6 +53,7 @@ from sglang.srt.disaggregation.decode_hicache_mixin import (
     HiCacheRestoreGatedKVReceiver,
     HiCacheRestoreResult,
 )
+from sglang.srt.disaggregation.kv_xfer_trace import TRACE as _KVXT
 from sglang.srt.disaggregation.minimax import minimax_index_transfer_pages
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
@@ -828,6 +829,17 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                         kv_pool.page_size,
                         slot_layer_ids=slot_layer_ids,
                     )
+        if _KVXT.on and self.transfer_backend == TransferBackend.NIXL:
+            _KVXT.bind(
+                kv_manager=kv_manager,
+                role="D",
+                pools=(
+                    transfer_kv_pool,
+                    self.draft_token_to_kv_pool,
+                    self.metadata_buffers,
+                ),
+                forward_ct=lambda: self.scheduler.forward_ct,
+            )
         return kv_manager
 
     def add(
@@ -3023,6 +3035,12 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     )
                 else:
                     transferred_reqs.append(decode_req.req)
+                    if _KVXT.on:
+                        _KVXT.req_event(
+                            "COMMIT",
+                            room=decode_req.req.bootstrap_room,
+                            rid=decode_req.req.rid,
+                        )
             elif poll in [
                 KVPoll.Bootstrapping,
                 KVPoll.WaitingForInput,
@@ -3514,6 +3532,9 @@ class SchedulerDisaggregationDecodeMixin:
             return None
 
         set_time_batch(can_run_list, "set_forward_entry_time")
+        if _KVXT.on:
+            for req in can_run_list:
+                _KVXT.req_event("ADMIT", room=req.bootstrap_room, rid=req.rid)
 
         # construct a schedule batch with those requests and mark as decode
         new_batch = ScheduleBatch.init_new(

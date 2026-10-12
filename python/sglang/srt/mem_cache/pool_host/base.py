@@ -426,6 +426,18 @@ class HostKVCache(abc.ABC):
         sizes = meta[1] if meta else None
         return int(sizes[0]) if sizes else None
 
+    def prepare_io_backend(self, io_backend: str) -> None:
+        """Validate this pool for `io_backend` and build its transfer kernels.
+
+        Runs once at controller startup, so an unsupported pool fails there
+        rather than on its first transfer.
+        """
+        if io_backend == "direct_kernel":
+            raise ValueError(
+                f"{type(self).__name__} does not support HiCache IO backend "
+                "'direct_kernel'; use 'direct'."
+            )
+
     def prepare_transfer_indices(
         self, host_indices, device_indices, io_backend
     ) -> tuple[torch.Tensor, torch.Tensor]:

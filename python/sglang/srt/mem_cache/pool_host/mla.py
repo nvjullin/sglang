@@ -19,6 +19,11 @@ from sglang.kernels.ops.kvcache.hicache import (
 from sglang.kernels.ops.kvcache.hicache import (
     transfer_hicache_one_layer_mla as jit_transfer_hicache_one_layer_mla,
 )
+from sglang.kernels.ops.kvcache.hicache_direct import (
+    can_use_hicache_direct_kernel,
+    transfer_hicache_direct_load,
+    transfer_hicache_direct_write_back,
+)
 from sglang.srt.layers.dcp.layout import maybe_dcp_kernel_indices
 from sglang.srt.mem_cache.device_pool_info import MLABufferInfo, MLASplitBuffers
 from sglang.srt.mem_cache.pool_host._kvcacheio import (
@@ -483,6 +488,35 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             device=self._transfer_device,
         )
 
+    def prepare_io_backend(self, io_backend: str) -> None:
+        if io_backend != "direct_kernel":
+            return
+        if self._is_dummy:
+            return
+        reason = None
+        if not _is_cuda:
+            reason = "it is CUDA-only"
+        elif self.layout != "page_first_direct":
+            reason = f"it needs the page_first_direct layout, got {self.layout}"
+        elif not self.device_rows_packed:
+            reason = "the device KV rows are strided"
+        elif self.dcp_size != 1:
+            reason = "decode context parallelism is not supported"
+        elif self._layer_shard_enabled:
+            reason = "layer-sharded device pools are not supported"
+        elif not can_use_hicache_direct_kernel(
+            page_bytes=self._direct_kernel_page_bytes, page_size=self.page_size
+        ):
+            reason = f"no kernel for {self._direct_kernel_page_bytes} B pages"
+        if reason is not None:
+            raise ValueError(
+                f"MLATokenToKVPoolHost cannot use HiCache IO backend 'direct_kernel': {reason}"
+            )
+
+    @property
+    def _direct_kernel_page_bytes(self) -> int:
+        return self.page_size * self.token_stride_size
+
     def _indexer_slot_range_for_layer(self, buffers, device_layer_id):
         if not buffers.index_layer_indices or self.index_k_buffer is None:
             return 0, -1
@@ -784,6 +818,16 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                 )
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
+        elif io_backend == "direct_kernel":
+            transfer_hicache_direct_load(
+                device_layer=device_buffer,
+                host_pool=self.kv_buffer,
+                host_indices=host_indices,
+                device_indices=device_indices,
+                host_layer_id=host_layer_id,
+                page_size=self.page_size,
+                page_bytes=self._direct_kernel_page_bytes,
+            )
         elif io_backend == "kernel_ascend":
             info_index = layer_id - self._device_layer_num + 1 if is_draft else 0
             native = self._native_infos[info_index].native_buffers()
@@ -1105,6 +1149,15 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                 )
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
+        elif io_backend == "direct_kernel":
+            transfer_hicache_direct_write_back(
+                host_pool=self.kv_buffer,
+                device_layer_ptrs=device_data_ptrs,
+                host_indices=host_indices,
+                device_indices=device_indices,
+                page_size=self.page_size,
+                page_bytes=self._direct_kernel_page_bytes,
+            )
         elif io_backend == "kernel_ascend":
             native = self._native_infos[0].native_buffers()
             if self.layout == "page_first_kv_split":

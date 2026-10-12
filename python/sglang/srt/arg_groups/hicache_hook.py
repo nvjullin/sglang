@@ -85,6 +85,14 @@ def handle_hicache(server_args: Any):
     resolve_storage_layout_compatibility(server_args)
     resolve_unified_memory_layout_io(server_args)
     if (
+        cfg.hicache_io_backend == "direct_kernel"
+        and cfg.hicache_mem_layout != "page_first_direct"
+    ):
+        raise ValueError(
+            "--hicache-io-backend direct_kernel requires the page_first_direct "
+            f"host layout, got --hicache-mem-layout {cfg.hicache_mem_layout}"
+        )
+    if (
         cfg.disaggregation_decode_host_receive_threshold < 1
         and cfg.hicache_mem_layout != "layer_first"
     ):
@@ -183,14 +191,18 @@ def resolve_layout_io_compatibility(server_args: Any):
             "Kernel io backend does not support page first direct layout, switching to direct io backend"
         )
 
-    if cfg.hicache_mem_layout == "page_first" and cfg.hicache_io_backend == "direct":
+    if cfg.hicache_mem_layout == "page_first" and cfg.hicache_io_backend in (
+        "direct",
+        "direct_kernel",
+    ):
         declare_resolution(
             server_args,
             "_resolve_layout_io_compatibility",
             hicache_mem_layout="page_first_direct",
         )
         logger.warning(
-            "Page first layout is not supported with direct IO backend, switching to page first direct layout"
+            f"Page first layout is not supported with {cfg.hicache_io_backend} IO backend, "
+            "switching to page first direct layout"
         )
 
 
@@ -206,7 +218,7 @@ def resolve_storage_layout_compatibility(server_args: Any):
     ):
         return
 
-    if cfg.hicache_io_backend == "direct":
+    if cfg.hicache_io_backend in ("direct", "direct_kernel"):
         new_layout = "page_first_direct"
     elif cfg.hicache_io_backend == "kernel":
         new_layout = "page_first"

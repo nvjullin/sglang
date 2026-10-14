@@ -10,7 +10,7 @@ from sglang.srt.managers.overlap_utils import RelayPayload
 from sglang.srt.mem_cache.common import checkpoint_kv_cache
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
-from sglang.srt.utils.common import is_pin_memory_available
+from sglang.srt.utils.common import async_h2d, is_pin_memory_available
 
 logger = logging.getLogger(__name__)
 
@@ -81,15 +81,15 @@ class ScheduleBatchDisaggregationDecodeMixin:
         # process_prebuilt through FutureMap, so merge/forward-entry rebuilds
         # input_ids from the relay.
         self.input_ids = None
-        self.req_pool_indices = torch.tensor(
+        # Non-blocking H2D: under overlap the schedule stream is fenced behind the
+        # in-flight forward, so a blocking copy would stall the host on it.
+        self.req_pool_indices = async_h2d(
             req_pool_indices, dtype=torch.int64, device=self.device
         )
         self.req_pool_indices_cpu = torch.tensor(req_pool_indices, dtype=torch.int64)
-        self.seq_lens = torch.tensor(seq_lens, dtype=torch.int64, device=self.device)
+        self.seq_lens = async_h2d(seq_lens, dtype=torch.int64, device=self.device)
         self.seq_lens_cpu = torch.tensor(seq_lens, dtype=torch.int64)
-        self.orig_seq_lens = torch.tensor(
-            seq_lens, dtype=torch.int32, device=self.device
-        )
+        self.orig_seq_lens = async_h2d(seq_lens, dtype=torch.int32, device=self.device)
         self.out_cache_loc = out_cache_loc
         self.seq_lens_sum = sum(seq_lens)
 

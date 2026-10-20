@@ -96,6 +96,9 @@ class _RecordingAgent:
             self.on_read()
         return "DONE" if self.reads[id(handle)] >= 2 else "PROC"
 
+    def send_notif(self, peer_name, msg):
+        pass
+
 
 def _tracer_env(stack: ExitStack, trace_dir: str, **extra):
     values = dict(
@@ -177,6 +180,8 @@ class TestPrefillWorkerTrace(CustomTestCase):
         mgr.req_to_decode_prefix_len = {ROOM: 0}
         mgr.transfer_queues = [FastQueue()]
         mgr.prep_handles = {"": "src_prep", "decode-agent": "dst_prep"}
+        mgr._prepared_state_plans = {}
+        mgr._state_layout_rejections = {}
         mgr._num_slots_src = 16
         mgr.kv_args = SimpleNamespace(
             engine_rank=0,

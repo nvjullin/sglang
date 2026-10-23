@@ -14,6 +14,7 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.cache_trace import TRACE as _CT
 from sglang.srt.mem_cache.cache_trace import guarded as _guarded
+from sglang.srt.mem_cache.cache_trace import page_keys as _page_keys
 from sglang.srt.mem_cache.cache_trace import rle as _rle
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorage,
@@ -1116,11 +1117,13 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 objects = ex[page * key_multiplier : (page + 1) * key_multiplier]
                 if objects and all(r == 1 for r in objects):
                     masks[page] |= 1 << bit
+        # batch_is_exist: 1 exists, 0 absent, negative on error; both read as absent.
         _CT.emit(
             "LK_EXIST",
             f"sfx={self.mla_suffix} pages={num_pages} "
             f"pools={'/'.join(str(t.name) for t, *_ in prepared)} "
             f"objs={len(all_exists)} present={sum(1 for r in all_exists if r == 1)} "
+            f"err={sum(1 for r in all_exists if r not in (0, 1))} "
             f"bits={_rle(format(m, 'x') for m in masks)}",
         )
 
@@ -1132,26 +1135,35 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         io_results: List[int],
         missing_idx: List[int],
         sizes: List[Any],
+        prepared: list,
         put_us: int,
     ) -> None:
-        # Runs on the offload thread, in the order the scheduler queued offloads.
+        # Runs on this stage's offload thread when its put returns, so the record
+        # time is when this stage's copy landed (or failed).
         codes: dict = {}
         put_bytes = 0
+        failed_pages: set = set()
+        page_keys = list(transfers[0].keys) if transfers else []
         for i in missing_idx:
             size = sizes[i]
             put_bytes += sum(size) if isinstance(size, list) else size
             if io_results[i] != 0:
                 codes[io_results[i]] = codes.get(io_results[i], 0) + 1
-        first = transfers[0].keys[0] if transfers and transfers[0].keys else ""
+                for transfer, (_, key_multiplier, start, end) in zip(
+                    transfers, prepared
+                ):
+                    if start <= i < end:
+                        failed_pages.add(transfer.keys[(i - start) // key_multiplier])
+                        break
         _CT.emit(
             "LK_PUT",
-            f"sfx={self.mla_suffix} k0={first[:16]} "
-            f"pages={len(transfers[0].keys) if transfers else 0} "
+            f"sfx={self.mla_suffix} pages={len(page_keys)} "
             f"objs={len(io_results)} existed={len(io_results) - len(missing_idx)} "
             f"put={len(missing_idx)} bytes={put_bytes} "
             f"failed={sum(codes.values())} "
             f"codes={'/'.join(f'{c}:{n}' for c, n in sorted(codes.items())) or '-'} "
-            f"us={put_us}",
+            f"us={put_us} keys={_page_keys(page_keys)} "
+            f"failed_keys={_page_keys(sorted(failed_pages)) or '-'}",
         )
 
     def _batch_io_v2(
@@ -1249,6 +1261,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                     io_results=io_results,
                     missing_idx=missing_idx,
                     sizes=all_sizes,
+                    prepared=prepared,
                     put_us=int((time.perf_counter() - put_started) * 1e6),
                 )
         else:

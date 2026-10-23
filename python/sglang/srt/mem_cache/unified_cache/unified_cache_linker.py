@@ -62,8 +62,9 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 device_module = get_device_module()
 
-# Every Nth traced lookup re-hashes its prefix from the sequence head.
-_HASH_CHECK_EVERY = int(os.environ.get("SGLANG_CACHE_TRACE_HASHCHECK_EVERY", "4"))
+# Every Nth traced lookup re-hashes its prefix from the sequence head (0: off).
+# Linear in the prefix and on the PP0 scheduler thread, hence sparse.
+_HASH_CHECK_EVERY = int(os.environ.get("SGLANG_CACHE_TRACE_HASHCHECK_EVERY", "64"))
 
 _EXTERNAL_LINKER_SUPPORTED_COMPONENTS = frozenset(
     {
@@ -496,7 +497,7 @@ class UnifiedCacheLinkerWrapper:
                 f"rid={rid} dev={device_hit_len} keys={_page_keys(tail_hashes)}",
             )
         self._trace_matches += 1
-        if self._trace_matches % _HASH_CHECK_EVERY:
+        if _HASH_CHECK_EVERY <= 0 or self._trace_matches % _HASH_CHECK_EVERY:
             return
         # The anchored tail must equal the same pages hashed from the sequence
         # head; a mismatch would make every lookup of this prefix miss.
@@ -675,7 +676,8 @@ class UnifiedCacheLinkerWrapper:
             f"n={node_id} pages={len(kv.keys)} queued={int(queued)} "
             f"pend={len(self.pending_offloads)}{keys}",
         )
-        self._trace_offload_t[node_id] = time.perf_counter()
+        if queued:
+            self._trace_offload_t[node_id] = time.perf_counter()
 
     def replace_pending_offload_node(
         self, ack_id: NodeId, old_node_id: NodeId, new_node_ids: list[NodeId]

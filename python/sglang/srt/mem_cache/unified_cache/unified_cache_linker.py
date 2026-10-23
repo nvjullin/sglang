@@ -45,6 +45,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchResult,
 )
 from sglang.srt.mem_cache.cache_trace import TRACE as _CT
+from sglang.srt.mem_cache.cache_trace import guarded as _guarded
 from sglang.srt.mem_cache.cache_trace import page_keys as _page_keys
 from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
@@ -754,6 +755,7 @@ class UnifiedCacheLinkerWrapper:
             page_size=page,
         )
 
+    @_guarded
     def _trace_match(
         self,
         *,
@@ -983,13 +985,7 @@ class UnifiedCacheLinkerWrapper:
             cache.dec_lock_ref(node_id, lock_params)
             raise
         if _CT.on:
-            kv = next(t for t in transfers if t.name == PoolName.KV)
-            _CT.emit(
-                "LK_OFF_Q",
-                f"n={node_id} pages={len(kv.keys)} queued={int(queued)} "
-                f"pend={len(self.pending_offloads)}",
-            )
-            self._trace_offload_t[node_id] = time.perf_counter()
+            self._trace_offload_queued(node_id, transfers, queued)
         if not queued:
             cache.dec_lock_ref(node_id, lock_params)
             return
@@ -1004,6 +1000,18 @@ class UnifiedCacheLinkerWrapper:
                 len(kv.keys) * cache.page_size if kv is not None else 0
             )
             self.metrics.set_linker_offloads_in_flight(len(self.pending_offloads))
+
+    @_guarded
+    def _trace_offload_queued(
+        self, node_id: NodeId, transfers: list[PoolTransfer], queued: bool
+    ) -> None:
+        kv = next(t for t in transfers if t.name == PoolName.KV)
+        _CT.emit(
+            "LK_OFF_Q",
+            f"n={node_id} pages={len(kv.keys)} queued={int(queued)} "
+            f"pend={len(self.pending_offloads)}",
+        )
+        self._trace_offload_t[node_id] = time.perf_counter()
 
     def replace_pending_offload_node(
         self, ack_id: NodeId, old_node_id: NodeId, new_node_ids: list[NodeId]

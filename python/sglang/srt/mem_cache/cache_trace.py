@@ -73,6 +73,7 @@ lets the server keep running rather than losing the job.
 from __future__ import annotations
 
 import atexit
+import functools
 import hashlib
 import logging
 import os
@@ -546,3 +547,17 @@ def rle(symbols) -> str:
     if prev is not None:
         runs.append(f"{prev}*{count}")
     return ",".join(runs)
+
+
+def guarded(fn):
+    """Run a trace helper that builds its own fields; an error is noted, never
+    raised into the caller."""
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except Exception:
+            TRACE._note_error(fn.__qualname__)
+
+    return wrapper

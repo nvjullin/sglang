@@ -508,15 +508,16 @@ class UnifiedCacheLinkerWrapper:
         if self._trace_tails.get(rid) == shape:
             return
         self._trace_tails[rid] = shape
-        # The pages this request will compute, keyed as their offload will be;
-        # hashed from the sequence head since the device prefix has no anchor.
-        full = get_storage_hash_str(
-            key[: device_hit_len + tail_len], None, page_size=self.cache.page_size
+        # The pages this request will compute, keyed as their offload will be:
+        # a node under an unhashed parent seeds a new chain from the namespace.
+        keys = get_storage_hash_str(
+            key[device_hit_len : device_hit_len + tail_len],
+            None,
+            page_size=self.cache.page_size,
         )
         _CT.emit(
             "LK_TAIL",
-            f"rid={rid} dev={device_hit_len} "
-            f"keys={_page_keys(full[device_hit_len // self.cache.page_size :])}",
+            f"rid={rid} dev={device_hit_len} keys={_page_keys(keys)}",
         )
 
     @_guarded

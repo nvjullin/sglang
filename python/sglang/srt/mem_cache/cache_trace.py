@@ -52,19 +52,23 @@ tree is the same.
                   rank's longest restorable tail (PP0: across stages); hit: after
                   the cross-rank intersection, what match reports
     LK_TAIL       rid dev keys       the looked-up tail's page keys, once per shape
-    LK_SKIP       why                lookup not issued (no_anchor, no_transfer)
+    LK_SKIP       [rid] why          lookup not issued (device_full, no_tail,
+                                     no_anchor, no_transfer); with rid it ends
+                                     that match round
     LK_HASHCHK    rid pages ok first_bad
                   sampled: the anchored tail re-hashed from the sequence head
-    LK_EXIST      sfx pages pools objs present err bits
+    LK_EXIST      sfx pages pools objs present err bits errbits
                   one existence query; bits is a run-length list of hex page
-                  masks, bit i set when every object of pool i exists
+                  masks, bit i set when every object of pool i exists; errbits
+                  likewise for pools with an object the query failed on
     LK_STAGE      rid st sfx pages found   that query's stage and result
     LK_LOAD       rid dev pages queued
     LK_LOADED     n ok rids          verdict of one batch's loads
     LK_OFF_Q      n pages queued pend [keys]   keys on PP0: the node's page keys
     LK_PUT        sfx pages objs existed put bytes failed codes us keys failed_keys
                   this stage's offload thread when its put returns; keys are the
-                  node's pages, failed_keys those with any failed object
+                  node's pages, failed_keys those with any failed object; a put
+                  that raised has failed=-1 codes=raised:<ready|io>
     LK_OFF_LOCAL  n failed block     this stage's own put verdicts
     LK_OFF_DONE   n ok pubs age_us   committed verdict (PP0's under PP)
 

@@ -13,6 +13,7 @@ import torch
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.cache_trace import TRACE as _CT
 from sglang.srt.mem_cache.cache_trace import guarded as _guarded
+from sglang.srt.mem_cache.cache_trace import page_keys as _page_keys
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageConfig,
     HiCacheStorageExtraInfo,
@@ -78,6 +79,19 @@ def _trace_stage(*, rid: str, stage: int, storage, pages: list, found: list) -> 
         "LK_STAGE",
         f"rid={rid} st={stage} sfx={storage.mla_suffix} "
         f"pages={len(pages)} found={found[-1] if found else 0}",
+    )
+
+
+@_guarded
+def _trace_put_raised(*, storage, transfers: list, phase: str) -> None:
+    # A raised offload returns no per-object codes; record every page as failed
+    # so this stage's attempt still ends in the trace.
+    keys = _page_keys(transfers[0].keys) if transfers else ""
+    _CT.emit(
+        "LK_PUT",
+        f"sfx={storage.mla_suffix} pages={len(transfers[0].keys) if transfers else 0} "
+        f"objs=0 existed=0 put=0 bytes=0 failed=-1 codes=raised:{phase} us=0 "
+        f"keys={keys or '-'} failed_keys={keys or '-'}",
     )
 
 
@@ -492,6 +506,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
     def offload_thread_func(self) -> None:
         while True:
             task = self.offload_queue.get()
+            phase = "ready"
             try:
                 if task is None:
                     return
@@ -502,6 +517,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     if session_id
                     else None
                 )
+                phase = "io"
                 results = self.storage.batch_set_v2(expanded, extra_info)
                 success = all(all(pool_results) for pool_results in results.values())
                 if success:
@@ -511,6 +527,10 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 self.offload_results.put(success)
             except BaseException:
                 logger.exception("Mooncake offload failed")
+                if _CT.on and task is not None:
+                    _trace_put_raised(
+                        storage=self.storage, transfers=task[0], phase=phase
+                    )
                 self.offload_results.put(False)
             finally:
                 self.offload_queue.task_done()

@@ -57,7 +57,7 @@ from sglang.srt.mem_cache.buffer_mode.storage_existence_cache import (
     default_belief_policy,
 )
 from sglang.srt.mem_cache.cache_trace import TRACE as _CT
-from sglang.srt.mem_cache.cache_trace import node_flags as _nf
+from sglang.srt.mem_cache.cache_trace import node_flags_by_id as _nf_id
 from sglang.srt.mem_cache.common import RetractionBackup
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
@@ -977,7 +977,7 @@ class UnifiedRadixCache(BasePrefixCache):
     ) -> Optional[BackupKV]:
         """Evict one device leaf, consuming its step result; returns the
         deferred write-back BackupKV when one must run before the demote."""
-        pre = _nf(self.tree_core.node_by_id(node_id)) if _CT.on else ""
+        pre = _nf_id(self.tree_core, node_id) if _CT.on else ""
         result = self.tree_core.evict_device_leaf(node_id, self.is_write_back)
         self._apply_eviction_result(result)
         if self._tracks_write_through_unbacked_evictions():
@@ -2023,7 +2023,7 @@ class UnifiedRadixCache(BasePrefixCache):
             _CT.emit(
                 "H2D_BEGIN",
                 f"n={node_id} quota={mem_quota} delta={result.delta} "
-                f"{_nf(self.tree_core.node_by_id(node_id))}",
+                f"{_nf_id(self.tree_core, node_id)}",
             )
         try:
             success = self._load_back_transfers(

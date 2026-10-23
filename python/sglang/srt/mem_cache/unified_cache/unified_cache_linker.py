@@ -668,10 +668,12 @@ class UnifiedCacheLinkerWrapper:
         self, node_id: NodeId, transfers: list[PoolTransfer], queued: bool
     ) -> None:
         kv = next(t for t in transfers if t.name == PoolName.KV)
+        # The transfer's own keys: the Rust TreeCore emits no LK_NODE_KEYS.
+        keys = f" keys={_page_keys(kv.keys)}" if _CT.keys_owner else ""
         _CT.emit(
             "LK_OFF_Q",
             f"n={node_id} pages={len(kv.keys)} queued={int(queued)} "
-            f"pend={len(self.pending_offloads)}",
+            f"pend={len(self.pending_offloads)}{keys}",
         )
         self._trace_offload_t[node_id] = time.perf_counter()
 

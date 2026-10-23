@@ -276,6 +276,15 @@ class _PendingOffload(NamedTuple):
     publish_node_ids: list[NodeId]
 
 
+@_guarded
+def _trace_init(*, cache, cache_linker) -> None:
+    _CT.emit(
+        "LK_INIT",
+        f"pp={cache.pp_rank}/{cache.pp_size} page={cache.page_size} "
+        f"pools={'/'.join(sorted(str(name) for name in cache_linker.pools))}",
+    )
+
+
 class UnifiedCacheLinkerWrapper:
     """Drives an external KV store on behalf of one :class:`UnifiedRadixCache`."""
 
@@ -320,11 +329,7 @@ class UnifiedCacheLinkerWrapper:
         self._trace_matches = 0
         self._trace_offload_t: dict[NodeId, float] = {}
         if _CT.on:
-            _CT.emit(
-                "LK_INIT",
-                f"pp={cache.pp_rank}/{cache.pp_size} page={cache.page_size} "
-                f"pools={'/'.join(sorted(str(name) for name in cache_linker.pools))}",
-            )
+            _trace_init(cache=cache, cache_linker=cache_linker)
 
         cache.tree_core.enable_external_cache_linker = True
         cache.write_through_threshold = 1

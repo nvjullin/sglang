@@ -15,6 +15,7 @@ import numpy as np
 import torch
 
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.mem_cache.cache_trace import TRACE as _CT
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageConfig,
     HiCacheStorageExtraInfo,
@@ -390,13 +391,20 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         if not page_keys:
             return []
         restorable = None
-        for storage, pools in stages:
+        for stage, (storage, pools) in enumerate(stages):
             # Mooncake's existence query also leases each page it finds (master
             # default_kv_lease_ttl), keeping another stage's pages until it loads.
             result = storage.batch_exists_v2(
                 page_keys, [transfer for transfer in expanded if transfer.name in pools]
             )
             found = result.restorable_prefix_pages or []
+            if _CT.on:
+                # Follows this stage's LK_EXIST record from batch_exists_v2.
+                _CT.emit(
+                    "LK_STAGE",
+                    f"rid={rid} st={stage} sfx={storage.mla_suffix} "
+                    f"pages={len(page_keys)} found={found[-1] if found else 0}",
+                )
             if restorable is not None:
                 stage_found = set(found)
                 found = [pages for pages in restorable if pages in stage_found]

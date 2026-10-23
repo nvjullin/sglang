@@ -38,6 +38,34 @@ One record per line::
             ``<stream>.stacks.json`` and ``<stream>.stacks.pkl`` at exit, so the
             trace can be read either standalone or with the side table.
 
+External-linker events
+----------------------
+Page keys are the first 16 hex chars of the SHA-256 storage chain hash, so a
+reader can join puts with lookups across processes (the store is shared by
+every prefill worker). Keys and tails are written by PP0 only; every stage's
+tree is the same.
+
+    LK_NODE_KEYS  n pages keys       page keys of a new tree node (SPLIT cuts them)
+    LK_MATCH      rid klen dev tail local ncand hit
+                  dev: device-hit tokens; tail: lookup pages past it; local: this
+                  rank's longest restorable tail (PP0: across stages); hit: after
+                  the cross-rank intersection, what match reports
+    LK_TAIL       rid dev keys       the looked-up tail's page keys, once per shape
+    LK_SKIP       why                lookup not issued (no_anchor, no_transfer)
+    LK_HASHCHK    rid pages ok first_bad
+                  sampled: the anchored tail re-hashed from the sequence head
+    LK_EXIST      sfx pages pools objs present bits
+                  one existence query; bits is a run-length list of hex page
+                  masks, bit i set when every object of pool i exists
+    LK_STAGE      rid st sfx pages found   that query's stage and result
+    LK_LOAD       rid dev pages queued
+    LK_LOADED     n ok rids          verdict of one batch's loads
+    LK_OFF_Q      n pages queued pend
+    LK_PUT        sfx k0 pages objs existed put bytes failed codes us
+                  offload thread; same order as the queued LK_OFF_Q records
+    LK_OFF_LOCAL  n failed block     this stage's own put verdicts
+    LK_OFF_DONE   n ok pubs age_us   committed verdict (PP0's under PP)
+
 Everything the tracer does is wrapped: an error inside it disables tracing and
 lets the server keep running rather than losing the job.
 """
@@ -48,6 +76,7 @@ import atexit
 import hashlib
 import logging
 import os
+import socket
 import sys
 import threading
 import time
@@ -184,6 +213,7 @@ class _Tracer:
         self._stacks: dict[tuple, str] = {}
         self._table: dict[str, str] = {}
         self._pending = 0
+        self._last_flush = time.monotonic()
         self._bytes = 0
         self._capped = False
         self._errors = 0
@@ -198,6 +228,7 @@ class _Tracer:
         self._host_free = None
         self._tree = None
         self._cache = None
+        self.keys_owner = False
 
     # ---- lifecycle -------------------------------------------------------
 
@@ -207,7 +238,13 @@ class _Tracer:
         try:
             os.makedirs(_DIR, exist_ok=True)
             rank = self._guess_rank()
-            base = os.path.join(_DIR, f"cachetrace_{rank}_pid{os.getpid()}.log")
+            # Prefill workers on different nodes share the log directory, and
+            # every PP stage reports the same attention DP rank.
+            pp = self._ranks().get("pp")
+            if pp is not None:
+                rank = f"{rank}_pp{pp}"
+            host = socket.gethostname().split(".")[0]
+            base = os.path.join(_DIR, f"cachetrace_{host}_{rank}_pid{os.getpid()}.log")
             if _GZIP:
                 import gzip
 
@@ -246,6 +283,12 @@ class _Tracer:
         except Exception:
             pass
         try:
+            from sglang.srt.distributed.parallel_state import get_pp_group
+
+            out["pp"] = get_pp_group().rank_in_group
+        except Exception:
+            pass
+        try:
             import torch.distributed as dist
 
             if dist.is_initialized():
@@ -274,11 +317,16 @@ class _Tracer:
             self._dev_free = alloc.available_size
             self._tree = cache.tree_core
             self._cache = cache
+            # Every PP stage holds the same tree, so one stage writing page keys
+            # is enough for an offline join.
+            self.keys_owner = cache.pp_rank == 0
             self.emit(
                 "INIT",
                 f"dev_cap={alloc.size} page={cache.page_size} "
                 f"write_back={int(bool(cache.is_write_back))} "
-                f"components={'/'.join(str(c) for c in cache.tree_components)}",
+                f"components={'/'.join(str(c) for c in cache.tree_components)} "
+                f"pp={cache.pp_rank}/{cache.pp_size} "
+                f"linker={int(cache.linker is not None)}",
             )
         except Exception:
             self._note_error("attach")
@@ -432,8 +480,12 @@ class _Tracer:
                     f"S={stack}"
                 )
                 self._pending += 1
-                if self._pending >= _FLUSH_EVERY:
+                now = time.monotonic()
+                # Time-bounded too: a job cancelled from outside never runs atexit,
+                # and only flushed gzip blocks survive.
+                if self._pending >= _FLUSH_EVERY or now - self._last_flush > 5:
                     self._pending = 0
+                    self._last_flush = now
                     self._fh.flush()
         except Exception:
             self._fail("emit")
@@ -449,7 +501,8 @@ def node_flags(node) -> str:
     """Residency + lock state of one tree node, for the detail field.
 
     dv/hv: Full KV present on device / host. lk/hlk: Full lock refs. wt/lb:
-    in-flight write-through / load-back anchors.
+    in-flight write-through / load-back anchors. es: an external-linker copy is
+    confirmed (stored by this tree, or restored from the store).
     """
     try:
         cd = node.component_data[0]
@@ -459,9 +512,37 @@ def node_flags(node) -> str:
             f"lk={cd.lock_ref} hlk={cd.host_lock_ref} "
             f"wt={-1 if node.write_through_pending_id is None else node.write_through_pending_id} "
             f"lb={-1 if node.load_back_pending_id is None else node.load_back_pending_id} "
+            f"es={int(node.external_cache_stored)} "
             f"kl={0 if node.key is None else len(node.key)} "
             f"nc={len(node.children)} "
             f"par={-1 if node.parent is None else node.parent.id}"
         )
     except Exception:
-        return "dv=? hv=? lk=? hlk=? wt=? lb=? kl=? nc=? par=?"
+        return "dv=? hv=? lk=? hlk=? wt=? lb=? es=? kl=? nc=? par=?"
+
+
+# Page keys are SHA-256 hex chains; 64 bits is plenty to join puts with lookups.
+KEY_HEX = 16
+
+
+def page_keys(hashes) -> str:
+    """Comma-joined short page keys, in prefix order."""
+    return ",".join(h[:KEY_HEX] for h in hashes)
+
+
+def rle(symbols) -> str:
+    """Run-length encode a sequence of short symbols as ``sym*count,...``."""
+    runs = []
+    prev = None
+    count = 0
+    for sym in symbols:
+        if sym == prev:
+            count += 1
+            continue
+        if prev is not None:
+            runs.append(f"{prev}*{count}")
+        prev = sym
+        count = 1
+    if prev is not None:
+        runs.append(f"{prev}*{count}")
+    return ",".join(runs)

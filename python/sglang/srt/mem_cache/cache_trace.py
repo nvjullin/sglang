@@ -40,7 +40,8 @@ One record per line::
 
 External-linker events
 ----------------------
-``LK_INIT pp page pools`` marks a rank that runs the linker.
+``LK_INIT pp page eagle pools`` marks a rank that runs the linker; with eagle=1
+the tree keys are bigrams, so page i of a tail needs raw token dev+(i+1)*page.
 Page keys are the first 16 hex chars of the SHA-256 storage chain hash, so a
 reader can join puts with lookups across processes (the store is shared by
 every prefill worker). Keys and tails are written by PP0 only; every stage's
@@ -51,10 +52,11 @@ tree is the same.
                   dev: device-hit tokens; tail: lookup pages past it; local: this
                   rank's longest restorable tail (PP0: across stages); hit: after
                   the cross-rank intersection, what match reports
-    LK_TAIL       rid dev keys       the looked-up tail's page keys, once per shape
-    LK_SKIP       [rid] why          lookup not issued (device_full, no_tail,
-                                     no_anchor, no_transfer); with rid it ends
-                                     that match round
+    LK_TAIL       rid dev keys       the looked-up tail's page keys, once per shape;
+                                     after a no_anchor skip, the tail's keys hashed
+                                     from the sequence head
+    LK_SKIP       rid why            lookup not issued (device_full, no_tail,
+                                     no_anchor, no_transfer); ends that match round
     LK_HASHCHK    rid pages ok first_bad
                   sampled: the anchored tail re-hashed from the sequence head
     LK_EXIST      sfx pages pools objs present err bits errbits
@@ -66,9 +68,11 @@ tree is the same.
     LK_LOADED     n ok rids          verdict of one batch's loads
     LK_OFF_Q      n pages queued pend [keys]   keys on PP0: the node's page keys
     LK_PUT        sfx pages objs existed put bytes failed codes us keys failed_keys
+                  existed_keys
                   this stage's offload thread when its put returns; keys are the
-                  node's pages, failed_keys those with any failed object; a put
-                  that raised has failed=-1 codes=raised:<ready|io>
+                  node's pages, failed_keys those with any failed object,
+                  existed_keys those with no object written (already stored); a
+                  put that raised has failed=-1 codes=raised:<ready|io>
     LK_OFF_LOCAL  n failed block     this stage's own put verdicts
     LK_OFF_DONE   n ok pubs age_us   committed verdict (PP0's under PP)
 

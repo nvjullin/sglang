@@ -91,7 +91,7 @@ def _trace_put_raised(*, storage, transfers: list, phase: str) -> None:
         "LK_PUT",
         f"sfx={storage.mla_suffix} pages={len(transfers[0].keys) if transfers else 0} "
         f"objs=0 existed=0 put=0 bytes=0 failed=-1 codes=raised:{phase} us=0 "
-        f"keys={keys or '-'} failed_keys={keys or '-'}",
+        f"keys={keys or '-'} failed_keys={keys or '-'} existed_keys=-",
     )
 
 

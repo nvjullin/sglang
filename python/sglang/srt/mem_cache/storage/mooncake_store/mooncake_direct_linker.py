@@ -12,6 +12,7 @@ import torch
 
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.cache_trace import TRACE as _CT
+from sglang.srt.mem_cache.cache_trace import guarded as _guarded
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageConfig,
     HiCacheStorageExtraInfo,
@@ -68,6 +69,16 @@ def _pipeline_stage_storages(
         )
         views.append(view)
     return views
+
+
+@_guarded
+def _trace_stage(*, rid: str, stage: int, storage, pages: list, found: list) -> None:
+    # Follows this stage's LK_EXIST record from batch_exists_v2.
+    _CT.emit(
+        "LK_STAGE",
+        f"rid={rid} st={stage} sfx={storage.mla_suffix} "
+        f"pages={len(pages)} found={found[-1] if found else 0}",
+    )
 
 
 def _check_stage_pools(stage_pools: list[frozenset[PoolName]]) -> None:
@@ -270,11 +281,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             )
             found = result.restorable_prefix_pages or []
             if _CT.on:
-                # Follows this stage's LK_EXIST record from batch_exists_v2.
-                _CT.emit(
-                    "LK_STAGE",
-                    f"rid={rid} st={stage} sfx={storage.mla_suffix} "
-                    f"pages={len(page_keys)} found={found[-1] if found else 0}",
+                _trace_stage(
+                    rid=rid, stage=stage, storage=storage, pages=page_keys, found=found
                 )
             if restorable is not None:
                 stage_found = set(found)

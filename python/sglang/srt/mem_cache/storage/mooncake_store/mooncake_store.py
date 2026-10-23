@@ -15,6 +15,7 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.cache_trace import TRACE as _CT
+from sglang.srt.mem_cache.cache_trace import guarded as _guarded
 from sglang.srt.mem_cache.cache_trace import rle as _rle
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorage,
@@ -1231,6 +1232,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         final_pages = restorable[-1] if restorable else 0
         return PoolTransferResult(final_pages, hit_count, restorable)
 
+    @_guarded
     def _trace_exists(self, prepared, all_exists, num_pages: int) -> None:
         # One hex digit per page: bit i is set when every object of pool i exists.
         masks = [0] * num_pages
@@ -1248,6 +1250,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             f"bits={_rle(format(m, 'x') for m in masks)}",
         )
 
+    @_guarded
     def _trace_put(
         self,
         *,

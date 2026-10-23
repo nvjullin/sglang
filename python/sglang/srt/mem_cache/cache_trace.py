@@ -55,15 +55,16 @@ tree is the same.
     LK_SKIP       why                lookup not issued (no_anchor, no_transfer)
     LK_HASHCHK    rid pages ok first_bad
                   sampled: the anchored tail re-hashed from the sequence head
-    LK_EXIST      sfx pages pools objs present bits
+    LK_EXIST      sfx pages pools objs present err bits
                   one existence query; bits is a run-length list of hex page
                   masks, bit i set when every object of pool i exists
     LK_STAGE      rid st sfx pages found   that query's stage and result
     LK_LOAD       rid dev pages queued
     LK_LOADED     n ok rids          verdict of one batch's loads
     LK_OFF_Q      n pages queued pend [keys]   keys on PP0: the node's page keys
-    LK_PUT        sfx k0 pages objs existed put bytes failed codes us
-                  offload thread; same order as the queued LK_OFF_Q records
+    LK_PUT        sfx pages objs existed put bytes failed codes us keys failed_keys
+                  this stage's offload thread when its put returns; keys are the
+                  node's pages, failed_keys those with any failed object
     LK_OFF_LOCAL  n failed block     this stage's own put verdicts
     LK_OFF_DONE   n ok pubs age_us   committed verdict (PP0's under PP)
 
@@ -327,7 +328,8 @@ class _Tracer:
                 f"dev_cap={alloc.size} page={cache.page_size} "
                 f"write_back={int(bool(cache.is_write_back))} "
                 f"components={'/'.join(str(c) for c in cache.tree_components)} "
-                f"pp={cache.pp_rank}/{cache.pp_size}",
+                f"pp={cache.pp_rank}/{cache.pp_size} "
+                f"core={type(cache.tree_core).__name__}",
             )
         except Exception:
             self._note_error("attach")
@@ -400,8 +402,10 @@ class _Tracer:
             self._open()
         if self._fh is not None:
             try:
-                self._raw(f"#X|{where}|{detail}")
-                self._fh.flush()
+                # The offload thread runs guarded helpers too; keep lines whole.
+                with self._lock:
+                    self._raw(f"#X|{where}|{detail}")
+                    self._fh.flush()
             except Exception:
                 pass
 

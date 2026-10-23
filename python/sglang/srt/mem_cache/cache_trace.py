@@ -46,7 +46,7 @@ reader can join puts with lookups across processes (the store is shared by
 every prefill worker). Keys and tails are written by PP0 only; every stage's
 tree is the same.
 
-    LK_NODE_KEYS  n pages keys       page keys of a new tree node (SPLIT cuts them)
+    LK_NODE_KEYS  n pages keys       page keys of a new tree node (Python TreeCore only)
     LK_MATCH      rid klen dev tail local ncand hit
                   dev: device-hit tokens; tail: lookup pages past it; local: this
                   rank's longest restorable tail (PP0: across stages); hit: after
@@ -61,7 +61,7 @@ tree is the same.
     LK_STAGE      rid st sfx pages found   that query's stage and result
     LK_LOAD       rid dev pages queued
     LK_LOADED     n ok rids          verdict of one batch's loads
-    LK_OFF_Q      n pages queued pend
+    LK_OFF_Q      n pages queued pend [keys]   keys on PP0: the node's page keys
     LK_PUT        sfx k0 pages objs existed put bytes failed codes us
                   offload thread; same order as the queued LK_OFF_Q records
     LK_OFF_LOCAL  n failed block     this stage's own put verdicts
@@ -433,22 +433,19 @@ class _Tracer:
         return h
 
     def _pools(self):
-        """(device free, host free, evictable, protected, nodes); -1 when unknown."""
-        try:
-            dF = self._dev_free() if self._dev_free is not None else -1
-            hF = self._host_free() if self._host_free is not None else -1
-            tree = self._tree
-            if tree is None:
-                return dF, hF, -1, -1, -1
-            return (
-                dF,
-                hF,
-                tree.evictable_size(),
-                tree.protected_size(),
-                len(tree._node_arena),
-            )
-        except Exception:
-            return -1, -1, -1, -1, -1
+        """(device free, host free, evictable, protected, nodes); -1 when unknown.
+
+        Each field is read on its own: the Rust TreeCore has no node arena, and
+        one missing reader must not blank the others.
+        """
+        tree = self._tree
+        return (
+            _read(self._dev_free),
+            _read(self._host_free),
+            _read(None if tree is None else tree.evictable_size),
+            _read(None if tree is None else tree.protected_size),
+            _read(None if tree is None else lambda: len(tree._node_arena)),
+        )
 
     def emit(self, event: str, detail: str = "") -> None:
         if not self.on:
@@ -496,6 +493,24 @@ TRACE = _Tracer()
 TRACE.on = _ENABLED
 _NVTX_MIRROR = _NvtxMirror()
 _NVTX_MIRROR.enable()
+
+
+def _read(fn) -> int:
+    if fn is None:
+        return -1
+    try:
+        return fn()
+    except Exception:
+        return -1
+
+
+def node_flags_by_id(tree_core, node_id) -> str:
+    """node_flags for a node id; the Rust TreeCore cannot hand out nodes."""
+    try:
+        node = tree_core.node_by_id(node_id)
+    except Exception:
+        return "dv=? hv=? lk=? hlk=? wt=? lb=? es=? kl=? nc=? par=?"
+    return node_flags(node)
 
 
 def node_flags(node) -> str:

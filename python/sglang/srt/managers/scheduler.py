@@ -4766,9 +4766,7 @@ class Scheduler(
             _CT.emit(
                 "BATCH",
                 f"mode={batch.forward_mode} bs={batch.batch_size()} reqs="
-                + ",".join(
-                    f"{r.rid}:{r.seqlen}:{len(r.prefix_indices)}" for r in batch.reqs
-                ),
+                + ",".join(f"{r.rid}:{r.seqlen}:{r.prefix_len}" for r in batch.reqs),
             )
         batch.launch_ts = time.monotonic()
         batch.after_idle_gap = self._sched_idled

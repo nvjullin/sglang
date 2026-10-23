@@ -24,6 +24,8 @@ parallelism it raises instead, since only the failing stage would abort them.
 from __future__ import annotations
 
 import logging
+import os
+import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Sequence
 from concurrent.futures import Future
@@ -35,6 +37,8 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     MatchResult,
 )
+from sglang.srt.mem_cache.cache_trace import TRACE as _CT
+from sglang.srt.mem_cache.cache_trace import page_keys as _page_keys
 from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
     PoolTransfer,
@@ -56,6 +60,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 device_module = get_device_module()
+
+# Every Nth traced lookup re-hashes its prefix from the sequence head.
+_HASH_CHECK_EVERY = int(os.environ.get("SGLANG_CACHE_TRACE_HASHCHECK_EVERY", "4"))
 
 _EXTERNAL_LINKER_SUPPORTED_COMPONENTS = frozenset(
     {
@@ -305,6 +312,11 @@ class UnifiedCacheLinkerWrapper:
         self.inflight_load_index = -1
         # Offloads in flight, each holding a lock on its node until it lands.
         self.pending_offloads: list[_PendingOffload] = []
+        # Trace-only state: last tail shape written per rid, lookup count for
+        # the sampled hash check, and submit time per offloaded node.
+        self._trace_tails: dict[str, tuple[int, int]] = {}
+        self._trace_matches = 0
+        self._trace_offload_t: dict[NodeId, float] = {}
 
         cache.tree_core.enable_external_cache_linker = True
         cache.write_through_threshold = 1
@@ -336,16 +348,32 @@ class UnifiedCacheLinkerWrapper:
                 LinkerTransferPhase.LOOKUP, None, tail_hashes
             )
             if transfer is None:
+                if _CT.on:
+                    _CT.emit(
+                        "LK_SKIP",
+                        f"rid={req.rid} why=no_transfer "
+                        f"component={component.component_type}",
+                    )
                 return result
             lookup_transfers.append(transfer)
         by_pool = {transfer.name: transfer for transfer in lookup_transfers}
 
         # Tail-relative: page 0 of `tail_hashes` is the first uncached page.
+        restorable = self._lookup(req.rid, lookup_transfers)
         hit_pages = self._sync_restorable_prefix(
-            self._lookup(req.rid, lookup_transfers),
+            restorable,
             num_pages=len(tail_hashes),
             device_hit_pages=0,
         )
+        if _CT.on:
+            self._trace_match(
+                rid=req.rid,
+                key=key,
+                device_hit_len=device_hit_len,
+                tail_hashes=tail_hashes,
+                restorable=restorable,
+                hit_pages=hit_pages,
+            )
         if hit_pages == 0:
             return result
         hit_tokens = hit_pages * page
@@ -414,6 +442,12 @@ class UnifiedCacheLinkerWrapper:
         if device_hit_len > 0:
             last_hash = self.cache.get_last_hash_value(result.last_device_node)
             if last_hash is None:
+                if _CT.on:
+                    _CT.emit(
+                        "LK_SKIP",
+                        f"why=no_anchor dev={device_hit_len} "
+                        f"ldn={result.last_device_node}",
+                    )
                 # Without the anchor the tail would hash as if it started at the
                 # sequence head, yielding keys that can never match.
                 return []
@@ -425,6 +459,53 @@ class UnifiedCacheLinkerWrapper:
             key[device_hit_len : device_hit_len + tail_len],
             last_hash,
             page_size=page,
+        )
+
+    def _trace_match(
+        self,
+        *,
+        rid: str,
+        key: RadixKey,
+        device_hit_len: int,
+        tail_hashes: list[str],
+        restorable: list[int],
+        hit_pages: int,
+    ) -> None:
+        # local: this rank's longest restorable tail (PP0: across all stages).
+        _CT.emit(
+            "LK_MATCH",
+            f"rid={rid} klen={len(key)} dev={device_hit_len} tail={len(tail_hashes)} "
+            f"local={restorable[-1] if restorable else 0} ncand={len(restorable)} "
+            f"hit={hit_pages}",
+        )
+        if not _CT.keys_owner:
+            return
+        shape = (device_hit_len, len(tail_hashes))
+        if self._trace_tails.get(rid) != shape:
+            self._trace_tails[rid] = shape
+            _CT.emit(
+                "LK_TAIL",
+                f"rid={rid} dev={device_hit_len} keys={_page_keys(tail_hashes)}",
+            )
+        self._trace_matches += 1
+        if self._trace_matches % _HASH_CHECK_EVERY:
+            return
+        # The anchored tail must equal the same pages hashed from the sequence
+        # head; a mismatch would make every lookup of this prefix miss.
+        page = self.cache.page_size
+        full = get_storage_hash_str(
+            key[: device_hit_len + len(tail_hashes) * page], None, page_size=page
+        )
+        tail_from_head = full[device_hit_len // page :]
+        bad = next(
+            (i for i, (a, b) in enumerate(zip(tail_from_head, tail_hashes)) if a != b),
+            -1,
+        )
+        _CT.emit(
+            "LK_HASHCHK",
+            f"rid={rid} pages={len(tail_hashes)} "
+            f"ok={int(bad < 0 and len(tail_from_head) == len(tail_hashes))} "
+            f"first_bad={bad}",
         )
 
     # ---- init_load_back: remote -> request-private device slots ----
@@ -476,6 +557,12 @@ class UnifiedCacheLinkerWrapper:
                 ExternalLinkerLoadPhase.ABORT, req, component_transfers, prefix_len
             )
             raise
+        if _CT.on:
+            _CT.emit(
+                "LK_LOAD",
+                f"rid={req.rid} dev={device_hit_len} pages={len(tail_hashes)} "
+                f"queued={int(queued)}",
+            )
         if not queued:
             self._update_load(
                 ExternalLinkerLoadPhase.ABORT, req, component_transfers, prefix_len
@@ -559,6 +646,14 @@ class UnifiedCacheLinkerWrapper:
         except BaseException:
             cache.dec_lock_ref(node_id, lock_params)
             raise
+        if _CT.on:
+            kv = next(t for t in transfers if t.name == PoolName.KV)
+            _CT.emit(
+                "LK_OFF_Q",
+                f"n={node_id} pages={len(kv.keys)} queued={int(queued)} "
+                f"pend={len(self.pending_offloads)}",
+            )
+            self._trace_offload_t[node_id] = time.perf_counter()
         if not queued:
             cache.dec_lock_ref(node_id, lock_params)
             return
@@ -594,12 +689,29 @@ class UnifiedCacheLinkerWrapper:
         assert finish_count <= len(self.pending_offloads)
         pop = self.cache_linker.pop_completed_offload
         # Only PP passes block, so a linker with the zero-argument pop still works.
-        return [pop(block=True) if block else pop() for _ in range(finish_count)]
+        local = [pop(block=True) if block else pop() for _ in range(finish_count)]
+        if _CT.on and local:
+            # Local verdicts, before PP0's override under pipeline parallelism.
+            _CT.emit(
+                "LK_OFF_LOCAL",
+                f"n={len(local)} failed={len(local) - sum(map(bool, local))} "
+                f"block={int(block)}",
+            )
+        return local
 
     def commit_completed_offloads(self, successes: Sequence[bool]) -> None:
         assert len(successes) <= len(self.pending_offloads)
+        now = time.perf_counter()
         for success in successes:
             pending = self.pending_offloads.pop(0)
+            if _CT.on:
+                started = self._trace_offload_t.pop(pending.lock_node_id, now)
+                _CT.emit(
+                    "LK_OFF_DONE",
+                    f"n={pending.lock_node_id} ok={int(bool(success))} "
+                    f"pubs={','.join(str(i) for i in pending.publish_node_ids)} "
+                    f"age_us={int((now - started) * 1e6)}",
+                )
             self.cache.tree_core.finish_external_linker_offload(
                 pending.publish_node_ids, pending.lock_node_id, success
             )
@@ -629,6 +741,11 @@ class UnifiedCacheLinkerWrapper:
             dtype=torch.int,
         )
         self.cache._all_reduce_attn_groups(landed, torch.distributed.ReduceOp.MIN)
+        if _CT.on:
+            _CT.emit(
+                "LK_LOADED",
+                f"n={len(rids)} ok={int(landed.item())} rids={','.join(rids)}",
+            )
         for rid in rids:
             self.private_load_indices.pop(rid, None)
         if landed.item():
@@ -666,6 +783,7 @@ class UnifiedCacheLinkerWrapper:
 
     def release_request(self, rid: str) -> None:
         self.hit_markers.pop(rid, None)
+        self._trace_tails.pop(rid, None)
         # A queued load targets slots the request owns and is about to free.
         # A started one is finished by finish_loads before anything is freed.
         if rid in self.inflight_load_rids and self.cache_linker.cancel_queued_load(rid):

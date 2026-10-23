@@ -40,6 +40,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.mem_cache.cache_trace import TRACE as _CT
 from sglang.srt.mem_cache.cache_trace import node_flags as _nf
+from sglang.srt.mem_cache.cache_trace import page_keys as _page_keys
 from sglang.srt.mem_cache.events import KVCacheEventRecorder
 from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
@@ -754,9 +755,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
     def _assert_receipt_anchor(node: UnifiedTreeNode, params: DecLockRefParams) -> None:
         """A receipt releases only the node its acquire returned; a mispaired
         or unanchored one would silently release (or steal) another holder's segment."""
-        assert params.node_id == node.id, (
-            f"lock receipt anchored on node {params.node_id} released on node {node.id}"
-        )
+        assert (
+            params.node_id == node.id
+        ), f"lock receipt anchored on node {params.node_id} released on node {node.id}"
 
     def _release_components(
         self,
@@ -1582,6 +1583,12 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 "NEWNODE",
                 f"n={new_node.id} par={parent.id} klen={len(key)} vlen={len(value)}",
             )
+            if _CT.keys_owner and new_node.hash_value:
+                _CT.emit(
+                    "LK_NODE_KEYS",
+                    f"n={new_node.id} pages={len(new_node.hash_value)} "
+                    f"keys={_page_keys(new_node.hash_value)}",
+                )
         return new_node
 
     def _unevict_node_on_insert(
@@ -1750,12 +1757,12 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
     ) -> EvictDeviceNextNodeResult:
         """Resume an internal tombstone after the controller's backup attempt."""
         component = self.components_by_type[component_type]
-        assert component.is_evict_device_ongoing, (
-            f"{component_type.name} device eviction not started"
-        )
-        assert self._pending_internal_evictions.get(component_type) == node_id, (
-            f"no matching pending internal {component_type.name} eviction"
-        )
+        assert (
+            component.is_evict_device_ongoing
+        ), f"{component_type.name} device eviction not started"
+        assert (
+            self._pending_internal_evictions.get(component_type) == node_id
+        ), f"no matching pending internal {component_type.name} eviction"
         del self._pending_internal_evictions[component_type]
         # Consuming the pending request advances the walk even if I/O changed
         # this victim's eligibility. No frees occur before backup completion.
@@ -3021,9 +3028,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             covered = assign_end
             if covered >= window_end:
                 break
-        assert covered == window_end, (
-            f"attach_swa_window covered {covered} of [{window_start}, {window_end})"
-        )
+        assert (
+            covered == window_end
+        ), f"attach_swa_window covered {covered} of [{window_start}, {window_end})"
         return actions
 
     def _attach_swa_segment(

@@ -12,6 +12,8 @@ import requests
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.mem_cache.cache_trace import TRACE as _CT
+from sglang.srt.mem_cache.cache_trace import rle as _rle
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorage,
     HiCacheStorageConfig,
@@ -1057,6 +1059,8 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             prepared.append((transfer, key_multiplier, start, len(all_component_keys)))
 
         all_exists = self._batch_exist(all_component_keys) if all_component_keys else []
+        if _CT.on:
+            self._trace_exists(prepared, all_exists, kv_pages)
         for transfer, key_multiplier, start, end in prepared:
             if not restorable:
                 break
@@ -1100,6 +1104,52 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
 
         final_pages = restorable[-1] if restorable else 0
         return PoolTransferResult(final_pages, hit_count, restorable)
+
+    def _trace_exists(self, prepared, all_exists, num_pages: int) -> None:
+        # One hex digit per page: bit i is set when every object of pool i exists.
+        masks = [0] * num_pages
+        for bit, (_, key_multiplier, start, end) in enumerate(prepared):
+            ex = all_exists[start:end]
+            for page in range(min(num_pages, len(ex) // max(key_multiplier, 1))):
+                objects = ex[page * key_multiplier : (page + 1) * key_multiplier]
+                if objects and all(r == 1 for r in objects):
+                    masks[page] |= 1 << bit
+        _CT.emit(
+            "LK_EXIST",
+            f"sfx={self.mla_suffix} pages={num_pages} "
+            f"pools={'/'.join(str(t.name) for t, *_ in prepared)} "
+            f"objs={len(all_exists)} present={sum(1 for r in all_exists if r == 1)} "
+            f"bits={_rle(format(m, 'x') for m in masks)}",
+        )
+
+    def _trace_put(
+        self,
+        *,
+        transfers: List[PoolTransfer],
+        io_results: List[int],
+        missing_idx: List[int],
+        sizes: List[Any],
+        put_us: int,
+    ) -> None:
+        # Runs on the offload thread, in the order the scheduler queued offloads.
+        codes: dict = {}
+        put_bytes = 0
+        for i in missing_idx:
+            size = sizes[i]
+            put_bytes += sum(size) if isinstance(size, list) else size
+            if io_results[i] != 0:
+                codes[io_results[i]] = codes.get(io_results[i], 0) + 1
+        first = transfers[0].keys[0] if transfers and transfers[0].keys else ""
+        _CT.emit(
+            "LK_PUT",
+            f"sfx={self.mla_suffix} k0={first[:16]} "
+            f"pages={len(transfers[0].keys) if transfers else 0} "
+            f"objs={len(io_results)} existed={len(io_results) - len(missing_idx)} "
+            f"put={len(missing_idx)} bytes={put_bytes} "
+            f"failed={sum(codes.values())} "
+            f"codes={'/'.join(f'{c}:{n}' for c, n in sorted(codes.items())) or '-'} "
+            f"us={put_us}",
+        )
 
     def _batch_io_v2(
         self,
@@ -1173,6 +1223,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             assert exist_result is not None
             io_results = [0 if state == 1 else -1 for state in exist_result]
             missing_idx = [i for i, state in enumerate(exist_result) if state != 1]
+            put_started = time.perf_counter()
             if missing_idx:
                 put_results = self._put_batch_zero_copy_impl(
                     [all_key_strs[i] for i in missing_idx],
@@ -1189,6 +1240,14 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 )
                 for i, res in zip(missing_idx, put_results):
                     io_results[i] = res
+            if _CT.on:
+                self._trace_put(
+                    transfers=transfers,
+                    io_results=io_results,
+                    missing_idx=missing_idx,
+                    sizes=all_sizes,
+                    put_us=int((time.perf_counter() - put_started) * 1e6),
+                )
         else:
             io_results = self._get_batch_zero_copy_impl(
                 all_key_strs, all_ptrs, all_sizes

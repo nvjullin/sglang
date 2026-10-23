@@ -349,10 +349,16 @@ class UnifiedCacheLinkerWrapper:
         page = cache.page_size
         device_hit_len = result.device_prefix_len
         if device_hit_len >= len(key):
+            if _CT.on:
+                _CT.emit(
+                    "LK_SKIP", f"rid={req.rid} why=device_full dev={device_hit_len}"
+                )
             return result
 
         tail_hashes = self._tail_hashes(key, result, device_hit_len)
         if not tail_hashes:
+            if _CT.on:
+                _CT.emit("LK_SKIP", f"rid={req.rid} why=no_tail dev={device_hit_len}")
             return result
 
         lookup_transfers = []

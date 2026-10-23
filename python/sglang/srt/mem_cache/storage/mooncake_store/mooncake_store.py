@@ -1111,12 +1111,15 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
     def _trace_exists(self, prepared, all_exists, num_pages: int) -> None:
         # One hex digit per page: bit i is set when every object of pool i exists.
         masks = [0] * num_pages
+        errors = [0] * num_pages
         for bit, (_, key_multiplier, start, end) in enumerate(prepared):
             ex = all_exists[start:end]
             for page in range(min(num_pages, len(ex) // max(key_multiplier, 1))):
                 objects = ex[page * key_multiplier : (page + 1) * key_multiplier]
                 if objects and all(r == 1 for r in objects):
                     masks[page] |= 1 << bit
+                if any(r not in (0, 1) for r in objects):
+                    errors[page] |= 1 << bit
         # batch_is_exist: 1 exists, 0 absent, negative on error; both read as absent.
         _CT.emit(
             "LK_EXIST",
@@ -1124,7 +1127,8 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             f"pools={'/'.join(str(t.name) for t, *_ in prepared)} "
             f"objs={len(all_exists)} present={sum(1 for r in all_exists if r == 1)} "
             f"err={sum(1 for r in all_exists if r not in (0, 1))} "
-            f"bits={_rle(format(m, 'x') for m in masks)}",
+            f"bits={_rle(format(m, 'x') for m in masks)} "
+            f"errbits={_rle(format(m, 'x') for m in errors)}",
         )
 
     @_guarded

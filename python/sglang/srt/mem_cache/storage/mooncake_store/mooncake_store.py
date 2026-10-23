@@ -1147,18 +1147,21 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         codes: dict = {}
         put_bytes = 0
         failed_pages: set = set()
+        written_pages: set = set()
         page_keys = list(transfers[0].keys) if transfers else []
         for i in missing_idx:
             size = sizes[i]
             put_bytes += sum(size) if isinstance(size, list) else size
+            for transfer, (_, key_multiplier, start, end) in zip(transfers, prepared):
+                if start <= i < end:
+                    page_key = transfer.keys[(i - start) // key_multiplier]
+                    break
+            written_pages.add(page_key)
             if io_results[i] != 0:
                 codes[io_results[i]] = codes.get(io_results[i], 0) + 1
-                for transfer, (_, key_multiplier, start, end) in zip(
-                    transfers, prepared
-                ):
-                    if start <= i < end:
-                        failed_pages.add(transfer.keys[(i - start) // key_multiplier])
-                        break
+                failed_pages.add(page_key)
+        # Pages none of whose objects were written: the put only confirmed them.
+        existed_pages = [k for k in page_keys if k not in written_pages]
         _CT.emit(
             "LK_PUT",
             f"sfx={self.mla_suffix} pages={len(page_keys)} "
@@ -1167,7 +1170,8 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             f"failed={sum(codes.values())} "
             f"codes={'/'.join(f'{c}:{n}' for c, n in sorted(codes.items())) or '-'} "
             f"us={put_us} keys={_page_keys(page_keys)} "
-            f"failed_keys={_page_keys(sorted(failed_pages)) or '-'}",
+            f"failed_keys={_page_keys(sorted(failed_pages)) or '-'} "
+            f"existed_keys={_page_keys(existed_pages) or '-'}",
         )
 
     def _batch_io_v2(

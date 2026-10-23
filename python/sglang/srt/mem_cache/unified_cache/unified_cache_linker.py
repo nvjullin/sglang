@@ -281,6 +281,7 @@ def _trace_init(*, cache, cache_linker) -> None:
     _CT.emit(
         "LK_INIT",
         f"pp={cache.pp_rank}/{cache.pp_size} page={cache.page_size} "
+        f"eagle={int(cache.tree_core.is_eagle)} "
         f"pools={'/'.join(sorted(str(name) for name in cache_linker.pools))}",
     )
 
@@ -355,7 +356,11 @@ class UnifiedCacheLinkerWrapper:
                 )
             return result
 
-        tail_hashes = self._tail_hashes(key, result, device_hit_len)
+        tail_hashes = self._tail_hashes(
+            key=key, result=result, device_hit_len=device_hit_len, rid=req.rid
+        )
+        if tail_hashes is None:
+            return result
         if not tail_hashes:
             if _CT.on:
                 _CT.emit("LK_SKIP", f"rid={req.rid} why=no_tail dev={device_hit_len}")
@@ -454,30 +459,64 @@ class UnifiedCacheLinkerWrapper:
         return int(common[-1].item())
 
     def _tail_hashes(
-        self, key: RadixKey, result: MatchResult, device_hit_len: int
-    ) -> list[str]:
-        """Per-page storage hashes for the device-uncached tail of the prefix."""
+        self, *, key: RadixKey, result: MatchResult, device_hit_len: int, rid: str
+    ) -> Optional[list[str]]:
+        """Per-page storage hashes for the device-uncached tail of the prefix;
+        None when the device prefix has no hash to anchor them on."""
         last_hash = None
+        page = self.cache.page_size
+        tail_len = (len(key) - device_hit_len) // page * page
         if device_hit_len > 0:
             last_hash = self.cache.get_last_hash_value(result.last_device_node)
             if last_hash is None:
                 if _CT.on:
-                    _CT.emit(
-                        "LK_SKIP",
-                        f"why=no_anchor dev={device_hit_len} "
-                        f"ldn={result.last_device_node}",
+                    self._trace_no_anchor(
+                        rid=rid,
+                        key=key,
+                        device_hit_len=device_hit_len,
+                        tail_len=tail_len,
+                        last_device_node=result.last_device_node,
                     )
                 # Without the anchor the tail would hash as if it started at the
                 # sequence head, yielding keys that can never match.
-                return []
-        page = self.cache.page_size
-        tail_len = (len(key) - device_hit_len) // page * page
+                return None
         if tail_len == 0:
             return []
         return get_storage_hash_str(
             key[device_hit_len : device_hit_len + tail_len],
             last_hash,
             page_size=page,
+        )
+
+    @_guarded
+    def _trace_no_anchor(
+        self,
+        *,
+        rid: str,
+        key: RadixKey,
+        device_hit_len: int,
+        tail_len: int,
+        last_device_node: NodeId,
+    ) -> None:
+        _CT.emit(
+            "LK_SKIP",
+            f"rid={rid} why=no_anchor dev={device_hit_len} ldn={last_device_node}",
+        )
+        if not _CT.keys_owner or tail_len == 0:
+            return
+        shape = (device_hit_len, tail_len // self.cache.page_size)
+        if self._trace_tails.get(rid) == shape:
+            return
+        self._trace_tails[rid] = shape
+        # The pages this request will compute, keyed as their offload will be;
+        # hashed from the sequence head since the device prefix has no anchor.
+        full = get_storage_hash_str(
+            key[: device_hit_len + tail_len], None, page_size=self.cache.page_size
+        )
+        _CT.emit(
+            "LK_TAIL",
+            f"rid={rid} dev={device_hit_len} "
+            f"keys={_page_keys(full[device_hit_len // self.cache.page_size :])}",
         )
 
     @_guarded

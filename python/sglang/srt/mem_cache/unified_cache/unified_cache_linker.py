@@ -318,6 +318,12 @@ class UnifiedCacheLinkerWrapper:
         self._trace_tails: dict[str, tuple[int, int]] = {}
         self._trace_matches = 0
         self._trace_offload_t: dict[NodeId, float] = {}
+        if _CT.on:
+            _CT.emit(
+                "LK_INIT",
+                f"pp={cache.pp_rank}/{cache.pp_size} page={cache.page_size} "
+                f"pools={'/'.join(sorted(str(name) for name in cache_linker.pools))}",
+            )
 
         cache.tree_core.enable_external_cache_linker = True
         cache.write_through_threshold = 1

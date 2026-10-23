@@ -1366,7 +1366,7 @@ class PrefillAdder:
             _CT.set_req(req.rid, req.seqlen)
             _CT.emit(
                 "ADMIT",
-                f"plen={len(req.prefix_indices)} host_hit={req.host_hit_length} "
+                f"plen={req.prefix_len} host_hit={req.host_hit_length} "
                 f"fill={len(req.full_untruncated_fill_ids)} "
                 f"rem_total={self.rem_total_tokens} cur_rem={self.cur_rem_tokens}",
             )
@@ -1612,9 +1612,9 @@ class PrefillAdder:
         max_new_tokens = min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
         tile_tokens = input_tokens
         if self.dllm_config is not None:
-            assert truncation_align_size is None, (
-                "truncation_align_size is not supported for dllm prefill"
-            )
+            assert (
+                truncation_align_size is None
+            ), "truncation_align_size is not supported for dllm prefill"
             extend_len = self._get_dllm_extend_len(req, prefix_len)
             if extend_len <= 0:
                 return AddReqResult.OTHER

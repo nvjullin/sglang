@@ -40,6 +40,7 @@ One record per line::
 
 External-linker events
 ----------------------
+``LK_INIT pp page pools`` marks a rank that runs the linker.
 Page keys are the first 16 hex chars of the SHA-256 storage chain hash, so a
 reader can join puts with lookups across processes (the store is shared by
 every prefill worker). Keys and tails are written by PP0 only; every stage's
@@ -326,8 +327,7 @@ class _Tracer:
                 f"dev_cap={alloc.size} page={cache.page_size} "
                 f"write_back={int(bool(cache.is_write_back))} "
                 f"components={'/'.join(str(c) for c in cache.tree_components)} "
-                f"pp={cache.pp_rank}/{cache.pp_size} "
-                f"linker={int(cache.linker is not None)}",
+                f"pp={cache.pp_rank}/{cache.pp_size}",
             )
         except Exception:
             self._note_error("attach")

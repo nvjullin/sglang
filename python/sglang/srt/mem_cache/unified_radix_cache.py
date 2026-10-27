@@ -1382,9 +1382,9 @@ class UnifiedRadixCache(BasePrefixCache):
         new_last_node = result.last_device_node
         new_indices = self.path_device_indices(new_last_node)
         new_prefix_len = result.prefix_len
-        assert (
-            req.kv.cache_protected_len <= len(new_indices) + self.page_size - 1
-        ), f"{req.kv.cache_protected_len=}, {len(new_indices)=}, {page_aligned_len=}"
+        assert req.kv.cache_protected_len <= len(new_indices) + self.page_size - 1, (
+            f"{req.kv.cache_protected_len=}, {len(new_indices)=}, {page_aligned_len=}"
+        )
         assert (
             new_prefix_len <= len(new_indices) and len(new_indices) == page_aligned_len
         ), f"{new_prefix_len=}, {len(new_indices)=}, {page_aligned_len=}"
@@ -3665,9 +3665,9 @@ class UnifiedRadixCache(BasePrefixCache):
             self._all_reduce(ready_counts, torch.distributed.ReduceOp.MIN)
 
         count_values = list(map(int, ready_counts.tolist()))
-        assert (
-            digest == count_values[-2] and digest == -count_values[-1]
-        ), "write_back duplicate-reclaim victims diverged across PP/TP ranks"
+        assert digest == count_values[-2] and digest == -count_values[-1], (
+            "write_back duplicate-reclaim victims diverged across PP/TP ranks"
+        )
         return (
             count_values[0],
             count_values[1],
@@ -3770,9 +3770,9 @@ class UnifiedRadixCache(BasePrefixCache):
             )
             self._all_reduce(sync_tensor, torch.distributed.ReduceOp.MIN)
             finish_count = int(sync_tensor[0].item())
-            assert (
-                sync_tensor[1].item() == -sync_tensor[2].item()
-            ), "write_back duplicate-reclaim victims diverged across TP ranks"
+            assert sync_tensor[1].item() == -sync_tensor[2].item(), (
+                "write_back duplicate-reclaim victims diverged across TP ranks"
+            )
 
         while finish_count > 0:
             ack = cc.ack_load_queue.pop(0)

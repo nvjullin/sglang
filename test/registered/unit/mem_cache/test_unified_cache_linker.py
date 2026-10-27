@@ -611,7 +611,8 @@ class TestUnifiedCacheLinkerPythonBackend(
     def test_trace_tail_rewritten_when_lookup_gains_anchor(self):
         """A waiting request repeats its lookup; when its device prefix gains a page
         hash in between, the anchored tail has the same shape but other keys, and
-        must be traced too, or the offline join keeps keys no store query used."""
+        must be traced too and ahead of its match, or the offline join pairs the
+        match with keys no store query used."""
         cfg = CacheConfig(page_size=2, kv_size=64, max_context_len=64)
         self.cfg = cfg
         cache, allocator, req_to_token_pool = build_fixture(cfg)
@@ -636,6 +637,14 @@ class TestUnifiedCacheLinkerPythonBackend(
             tails[1], f"rid={req.rid} dev=4 keys={page_keys(kv_lookup.keys)}"
         )
         self.assertNotEqual(tails[0], tails[1])
+        self.assertEqual(
+            [
+                event
+                for event, _ in records
+                if event in ("LK_SKIP", "LK_TAIL", "LK_MATCH")
+            ],
+            ["LK_SKIP", "LK_TAIL", "LK_TAIL", "LK_MATCH"],
+        )
         self.assertEqual(errors, [])
 
     def test_failed_split_offload_retries_and_reset_releases_locks(self):

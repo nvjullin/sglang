@@ -533,6 +533,15 @@ class UnifiedCacheLinkerWrapper:
         restorable: list[int],
         hit_pages: int,
     ) -> None:
+        shape = (True, device_hit_len, len(tail_hashes))
+        # Ahead of its LK_MATCH: an offline join pairs a match with the rid's
+        # latest tail as soon as the match is read.
+        if _CT.keys_owner and self._trace_tails.get(rid) != shape:
+            self._trace_tails[rid] = shape
+            _CT.emit(
+                "LK_TAIL",
+                f"rid={rid} dev={device_hit_len} keys={_page_keys(tail_hashes)}",
+            )
         # local: this rank's longest restorable tail (PP0: across all stages).
         _CT.emit(
             "LK_MATCH",
@@ -542,13 +551,6 @@ class UnifiedCacheLinkerWrapper:
         )
         if not _CT.keys_owner:
             return
-        shape = (True, device_hit_len, len(tail_hashes))
-        if self._trace_tails.get(rid) != shape:
-            self._trace_tails[rid] = shape
-            _CT.emit(
-                "LK_TAIL",
-                f"rid={rid} dev={device_hit_len} keys={_page_keys(tail_hashes)}",
-            )
         self._trace_matches += 1
         if _HASH_CHECK_EVERY <= 0 or self._trace_matches % _HASH_CHECK_EVERY:
             return

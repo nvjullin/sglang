@@ -53,8 +53,9 @@ tree is the same.
                   rank's longest restorable tail (PP0: across stages); hit: after
                   the cross-rank intersection, what match reports
     LK_TAIL       rid dev keys       the looked-up tail's page keys, once per shape
-                                     and anchor mode; after a no_anchor skip, the keys
-                                     its offload will use (a new chain seeded at dev)
+                                     and anchor mode, ahead of that round's LK_MATCH;
+                                     after a no_anchor skip, the keys its offload will
+                                     use (a new chain seeded at dev)
     LK_SKIP       rid why            lookup not issued (device_full, no_tail,
                                      no_anchor, no_transfer); ends that match round
     LK_HASHCHK    rid pages ok first_bad

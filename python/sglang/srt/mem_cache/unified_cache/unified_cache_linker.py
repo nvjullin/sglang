@@ -324,9 +324,11 @@ class UnifiedCacheLinkerWrapper:
         self.inflight_load_index = -1
         # Offloads in flight, each holding a lock on its node until it lands.
         self.pending_offloads: list[_PendingOffload] = []
-        # Trace-only state: last tail shape written per rid, lookup count for
-        # the sampled hash check, and submit time per offloaded node.
-        self._trace_tails: dict[str, tuple[int, int]] = {}
+        # Trace-only state: last tail (anchored, dev, pages) written per rid,
+        # lookup count for the sampled hash check, and submit time per offloaded node.
+        # The anchor mode is part of the key: an anchored and an unanchored tail
+        # of the same shape hash to different chains.
+        self._trace_tails: dict[str, tuple[bool, int, int]] = {}
         self._trace_matches = 0
         self._trace_offload_t: dict[NodeId, float] = {}
         if _CT.on:
@@ -504,7 +506,7 @@ class UnifiedCacheLinkerWrapper:
         )
         if not _CT.keys_owner or tail_len == 0:
             return
-        shape = (device_hit_len, tail_len // self.cache.page_size)
+        shape = (False, device_hit_len, tail_len // self.cache.page_size)
         if self._trace_tails.get(rid) == shape:
             return
         self._trace_tails[rid] = shape
@@ -540,7 +542,7 @@ class UnifiedCacheLinkerWrapper:
         )
         if not _CT.keys_owner:
             return
-        shape = (device_hit_len, len(tail_hashes))
+        shape = (True, device_hit_len, len(tail_hashes))
         if self._trace_tails.get(rid) != shape:
             self._trace_tails[rid] = shape
             _CT.emit(
@@ -719,12 +721,13 @@ class UnifiedCacheLinkerWrapper:
     def _trace_offload_queued(
         self, node_id: NodeId, transfers: list[PoolTransfer], queued: bool
     ) -> None:
-        kv = next(t for t in transfers if t.name == PoolName.KV)
+        # A node without page hashes offloads no KV transfer; it traces as 0 pages.
+        kv_keys = next((t.keys for t in transfers if t.name == PoolName.KV), [])
         # The transfer's own keys: the Rust TreeCore emits no LK_NODE_KEYS.
-        keys = f" keys={_page_keys(kv.keys)}" if _CT.keys_owner else ""
+        keys = f" keys={_page_keys(kv_keys)}" if _CT.keys_owner and kv_keys else ""
         _CT.emit(
             "LK_OFF_Q",
-            f"n={node_id} pages={len(kv.keys)} queued={int(queued)} "
+            f"n={node_id} pages={len(kv_keys)} queued={int(queued)} "
             f"pend={len(self.pending_offloads)}{keys}",
         )
         if queued:
@@ -813,7 +816,7 @@ class UnifiedCacheLinkerWrapper:
         if _CT.on:
             _CT.emit(
                 "LK_LOADED",
-                f"n={len(rids)} ok={int(landed.item())} rids={','.join(rids)}",
+                f"n={len(rids)} ok={int(landed.item())} rids={','.join(map(str, rids))}",
             )
         for rid in rids:
             self.private_load_indices.pop(rid, None)

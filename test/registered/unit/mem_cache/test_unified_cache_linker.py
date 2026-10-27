@@ -1,4 +1,5 @@
 import queue
+import contextlib
 import sys
 import threading
 import unittest
@@ -18,6 +19,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
 )
+from sglang.srt.mem_cache.cache_trace import TRACE, page_keys
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageExtraInfo,
@@ -48,6 +50,7 @@ from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
 )
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.runtime_context import get_disagg
+from sglang.srt.mem_cache.utils import get_storage_hash_str
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 from sglang.test.kits.unified_radix_cache import fixtures as shared_cache_suite
 from sglang.test.kits.unified_radix_cache.config import (
@@ -176,6 +179,21 @@ def _swa_allocator(swa_req_ring):
     allocator = SWATokenToKVPoolAllocator.__new__(SWATokenToKVPoolAllocator)
     allocator._swa_req_ring = swa_req_ring
     return allocator
+
+
+@contextlib.contextmanager
+def _recorded_trace():
+    """Enable the cache tracer, keeping its records and errors in memory."""
+    records, errors = [], []
+    with (
+        patch.object(TRACE, "on", True),
+        patch.object(TRACE, "keys_owner", True),
+        patch.object(
+            TRACE, "emit", lambda event, detail="": records.append((event, detail))
+        ),
+        patch.object(TRACE, "_note_error", errors.append),
+    ):
+        yield records, errors
 
 
 def test_cache_linker_attachment_is_backend_independent():
@@ -529,6 +547,96 @@ class TestUnifiedCacheLinkerPythonBackend(
         match = consumer.match_prefix(MatchPrefixParams(key=key, req=req))
         self.assertEqual(match.host_hit_length, len(tokens))
         consumer.linker.release_request(req.rid)
+    def test_no_anchor_trace_tail_matches_its_offload_keys(self):
+        """A lookup whose device prefix has no page hash issues no store query; the
+        tail it traces must carry the keys those pages are later offloaded under,
+        or the offline join reads every one of them as never offloaded."""
+        for is_eagle, extra_key in ((False, None), (True, None), (False, "ns")):
+            with self.subTest(is_eagle=is_eagle, extra_key=extra_key):
+                cfg = CacheConfig(
+                    page_size=2, is_eagle=is_eagle, kv_size=64, max_context_len=64
+                )
+                self.cfg = cfg
+                cache, allocator, req_to_token_pool = build_fixture(cfg)
+                tokens = list(range(1, 9 + is_eagle))
+                # Built before the linker attaches, the prefix node has no hash.
+                self._insert(
+                    cache,
+                    allocator,
+                    req_to_token_pool,
+                    tokens[: 4 + is_eagle],
+                    extra_key=extra_key,
+                )
+                with _recorded_trace() as (records, errors):
+                    linker = _InMemoryUnifiedCacheLinker()
+                    cache.init_cache_linker(linker)
+                    req = self._make_req(req_to_token_pool)
+                    match = cache.match_prefix(
+                        MatchPrefixParams(
+                            key=RadixKey(array("q", tokens), extra_key=extra_key),
+                            req=req,
+                        )
+                    )
+                    inserted = self._insert(
+                        cache, allocator, req_to_token_pool, tokens, extra_key=extra_key
+                    )
+
+                self.assertEqual(match.device_prefix_len, 4)
+                self.assertEqual(linker.lookup_calls, [])
+                offload_keys = cache.tree_core.get_hash_values(
+                    inserted.last_device_node
+                )
+                self.assertEqual(len(offload_keys), 2)
+                self.assertIn(
+                    [offload_keys],
+                    [
+                        [t.keys for t in call if t.name == PoolName.KV]
+                        for call in linker.offload_calls
+                    ],
+                )
+                self.assertEqual(
+                    [detail for event, detail in records if event == "LK_TAIL"],
+                    [f"rid={req.rid} dev=4 keys={page_keys(offload_keys)}"],
+                )
+                self.assertEqual(
+                    [
+                        detail.rsplit(" ", 1)[0]
+                        for event, detail in records
+                        if event == "LK_INIT"
+                    ],
+                    [f"pp=0/1 page=2 eagle={int(is_eagle)}"],
+                )
+                self.assertEqual(errors, [])
+
+    def test_trace_tail_rewritten_when_lookup_gains_anchor(self):
+        """A waiting request repeats its lookup; when its device prefix gains a page
+        hash in between, the anchored tail has the same shape but other keys, and
+        must be traced too, or the offline join keeps keys no store query used."""
+        cfg = CacheConfig(page_size=2, kv_size=64, max_context_len=64)
+        self.cfg = cfg
+        cache, allocator, req_to_token_pool = build_fixture(cfg)
+        tokens = list(range(1, 9))
+        key = RadixKey(array("q", tokens))
+        self._insert(cache, allocator, req_to_token_pool, tokens[:4])
+        with _recorded_trace() as (records, errors):
+            linker = _InMemoryUnifiedCacheLinker()
+            cache.init_cache_linker(linker)
+            req = self._make_req(req_to_token_pool)
+            cache.match_prefix(MatchPrefixParams(key=key, req=req))
+            self.assertEqual(linker.lookup_calls, [])
+            self.assertEqual(cache.tree_core.backfill_missing_hash_values(), 1)
+            cache.match_prefix(MatchPrefixParams(key=key, req=req))
+
+        _, transfers = linker.lookup_calls[-1]
+        (kv_lookup,) = transfers
+        self.assertEqual(kv_lookup.keys, get_storage_hash_str(key, page_size=2)[2:])
+        tails = [detail for event, detail in records if event == "LK_TAIL"]
+        self.assertEqual(len(tails), 2)
+        self.assertEqual(
+            tails[1], f"rid={req.rid} dev=4 keys={page_keys(kv_lookup.keys)}"
+        )
+        self.assertNotEqual(tails[0], tails[1])
+        self.assertEqual(errors, [])
 
     def test_failed_split_offload_retries_and_reset_releases_locks(self):
         cfg = CacheConfig(page_size=1, kv_size=64, max_context_len=64)

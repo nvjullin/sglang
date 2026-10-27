@@ -52,9 +52,9 @@ tree is the same.
                   dev: device-hit tokens; tail: lookup pages past it; local: this
                   rank's longest restorable tail (PP0: across stages); hit: after
                   the cross-rank intersection, what match reports
-    LK_TAIL       rid dev keys       the looked-up tail's page keys, once per shape;
-                                     after a no_anchor skip, the keys its offload will
-                                     use (a new chain seeded at dev)
+    LK_TAIL       rid dev keys       the looked-up tail's page keys, once per shape
+                                     and anchor mode; after a no_anchor skip, the keys
+                                     its offload will use (a new chain seeded at dev)
     LK_SKIP       rid why            lookup not issued (device_full, no_tail,
                                      no_anchor, no_transfer); ends that match round
     LK_HASHCHK    rid pages ok first_bad
@@ -66,7 +66,8 @@ tree is the same.
     LK_STAGE      rid st sfx pages found   that query's stage and result
     LK_LOAD       rid dev pages queued
     LK_LOADED     n ok rids          verdict of one batch's loads
-    LK_OFF_Q      n pages queued pend [keys]   keys on PP0: the node's page keys
+    LK_OFF_Q      n pages queued pend [keys]   keys on PP0: the node's page keys;
+                                     pages=0 without keys: a node with no page hashes
     LK_PUT        sfx pages objs existed put bytes failed codes us keys failed_keys
                   existed_keys
                   this stage's offload thread when its put returns; keys are the

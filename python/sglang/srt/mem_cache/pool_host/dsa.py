@@ -12,9 +12,10 @@ from sglang.kernels.ops.kvcache.hicache import (
     transfer_hicache_all_layer_mla_staged_lf_pf as jit_transfer_hicache_all_layer_mla_staged_lf_pf,
 )
 from sglang.kernels.ops.kvcache.hicache_direct import (
+    HiCacheDirectTables,
     can_use_hicache_direct_kernel,
-    transfer_hicache_direct_load,
-    transfer_hicache_direct_write_back,
+    make_hicache_direct_tables,
+    transfer_hicache_direct,
 )
 from sglang.srt.mem_cache.device_pool_info import IndexKeyBufferInfo
 from sglang.srt.mem_cache.pool_host._kvcacheio import (
@@ -146,6 +147,8 @@ class DSAIndexerPoolHost(HostKVCache):
         self.size_per_token = self.indexer_layout_dim // self.page_size
         self.can_use_jit = False
         self.can_use_write_back_jit = False
+        # Built by prepare_io_backend("direct_kernel").
+        self._direct_kernel_tables: HiCacheDirectTables | None = None
         if self._is_dummy:
             self.index_k_with_scale_buffer = None
             self.index_k_device_ptrs = None
@@ -295,13 +298,16 @@ class DSAIndexerPoolHost(HostKVCache):
         elif self._is_device_layer_sharded(self.device_pool):
             reason = "layer-sharded device pools are not supported"
         elif not can_use_hicache_direct_kernel(
-            page_bytes=self._direct_kernel_page_bytes, page_size=self.page_size
+            page_bytes=self._direct_kernel_page_bytes
         ):
             reason = f"no kernel for {self._direct_kernel_page_bytes} B pages"
         if reason is not None:
             raise ValueError(
                 f"DSAIndexerPoolHost cannot use HiCache IO backend 'direct_kernel': {reason}"
             )
+        self._direct_kernel_tables = make_hicache_direct_tables(
+            self.index_k_with_scale_buffer, self.index_k_device_ptrs
+        )
 
     @property
     def _direct_kernel_page_bytes(self) -> int:
@@ -353,15 +359,14 @@ class DSAIndexerPoolHost(HostKVCache):
         )
 
         if io_backend == "direct_kernel":
-            # The kernel reads page numbers straight from the KV token slots.
-            transfer_hicache_direct_load(
-                device_layer=self.packed_device_index_buffers[host_layer_id],
-                host_pool=self.index_k_with_scale_buffer,
-                host_indices=host_indices,
-                device_indices=device_indices,
-                host_layer_id=host_layer_id,
+            # The kernel reads page numbers straight from the KV token slots. The
+            # packed device buffers follow host layer order, drafts included.
+            transfer_hicache_direct(
+                self._direct_kernel_tables.layer(host_layer_id, host_layer_id),
+                host_indices,
+                device_indices,
                 page_size=self.page_size,
-                page_bytes=self._direct_kernel_page_bytes,
+                load=True,
             )
             return
 
@@ -493,13 +498,12 @@ class DSAIndexerPoolHost(HostKVCache):
             return
 
         if io_backend == "direct_kernel":
-            transfer_hicache_direct_write_back(
-                host_pool=self.index_k_with_scale_buffer,
-                device_layer_ptrs=self.index_k_device_ptrs,
-                host_indices=host_indices,
-                device_indices=device_indices,
+            transfer_hicache_direct(
+                self._direct_kernel_tables,
+                host_indices,
+                device_indices,
                 page_size=self.page_size,
-                page_bytes=self._direct_kernel_page_bytes,
+                load=False,
             )
             return
 

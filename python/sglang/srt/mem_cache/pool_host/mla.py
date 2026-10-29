@@ -26,9 +26,10 @@ from sglang.kernels.ops.kvcache.hicache import (
     transfer_hicache_one_layer_mla_page_unified_lf as jit_transfer_hicache_one_layer_mla_page_unified_lf,
 )
 from sglang.kernels.ops.kvcache.hicache_direct import (
+    HiCacheDirectTables,
     can_use_hicache_direct_kernel,
-    transfer_hicache_direct_load,
-    transfer_hicache_direct_write_back,
+    make_hicache_direct_tables,
+    transfer_hicache_direct,
 )
 from sglang.srt.layers.dcp.layout import maybe_dcp_kernel_indices
 from sglang.srt.mem_cache.device_pool_info import MLABufferInfo, MLASplitBuffers
@@ -250,6 +251,8 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             host_token_capacity=host_token_capacity,
             is_dummy=self._is_dummy,
         )
+        # Built by prepare_io_backend("direct_kernel").
+        self._direct_kernel_tables: Optional[HiCacheDirectTables] = None
         if self._is_dummy:
             self.token_stride_size = self.kv_cache_dim * self.dtype.itemsize
             self.layout_dim = self.token_stride_size * self.layer_num
@@ -532,13 +535,16 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         elif self._layer_shard_enabled:
             reason = "layer-sharded device pools are not supported"
         elif not can_use_hicache_direct_kernel(
-            page_bytes=self._direct_kernel_page_bytes, page_size=self.page_size
+            page_bytes=self._direct_kernel_page_bytes
         ):
             reason = f"no kernel for {self._direct_kernel_page_bytes} B pages"
         if reason is not None:
             raise ValueError(
                 f"MLATokenToKVPoolHost cannot use HiCache IO backend 'direct_kernel': {reason}"
             )
+        self._direct_kernel_tables = make_hicache_direct_tables(
+            self.kv_buffer, self.device_data_ptrs
+        )
 
     @property
     def _direct_kernel_page_bytes(self) -> int:
@@ -854,14 +860,14 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
         elif io_backend == "direct_kernel":
-            transfer_hicache_direct_load(
-                device_layer=device_buffer,
-                host_pool=self.kv_buffer,
-                host_indices=host_indices,
-                device_indices=device_indices,
-                host_layer_id=host_layer_id,
+            transfer_hicache_direct(
+                self._direct_kernel_tables.layer(
+                    host_layer_id, self._buffer_index_by_layer[layer_id]
+                ),
+                host_indices,
+                device_indices,
                 page_size=self.page_size,
-                page_bytes=self._direct_kernel_page_bytes,
+                load=True,
             )
         elif io_backend == "kernel_ascend":
             info_index = layer_id - self._device_layer_num + 1 if is_draft else 0
@@ -1193,13 +1199,12 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
         elif io_backend == "direct_kernel":
-            transfer_hicache_direct_write_back(
-                host_pool=self.kv_buffer,
-                device_layer_ptrs=device_data_ptrs,
-                host_indices=host_indices,
-                device_indices=device_indices,
+            transfer_hicache_direct(
+                self._direct_kernel_tables,
+                host_indices,
+                device_indices,
                 page_size=self.page_size,
-                page_bytes=self._direct_kernel_page_bytes,
+                load=False,
             )
         elif io_backend == "kernel_ascend":
             native = self._native_infos[0].native_buffers()

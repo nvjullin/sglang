@@ -191,13 +191,13 @@ def _trace_put_raised(*, storage, transfers: list, phase: str) -> None:
 
 @_guarded
 def _trace_refresh(
-    *, storage, pages: list, objs: int, page_found: list, us: int
+    *, storage, reason: str, pages: list, objs: int, page_found: list, us: int
 ) -> None:
     # bits: per page, 1 when every queried object of the page exists.
     keys = f" keys={_page_keys(pages)}" if _CT.keys_owner else ""
     _CT.emit(
         "LK_REFRESH",
-        f"sfx={storage.mla_suffix} pages={len(pages)} objs={objs} "
+        f"sfx={storage.mla_suffix} why={reason} pages={len(pages)} objs={objs} "
         f"found={sum(page_found)} bits={_rle(page_found)} us={us}{keys}",
     )
 
@@ -370,7 +370,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         ] = Queue()
         self.offload_results: Queue[bool] = Queue()
         # (page keys, object keys per page) of pages that left the device.
-        self.refresh_queue: Queue[tuple[list[str], list[list[str]]] | None] = Queue()
+        self.refresh_queue: Queue[tuple[str, list[str], list[list[str]]] | None] = (
+            Queue()
+        )
         self.stats = {"lookup": 0, "load": 0, "offload": 0}
         self.load_io_executor = ThreadPoolExecutor(
             self.load_threads, thread_name_prefix=f"mooncake-load-io-tp{tp_rank}"
@@ -821,7 +823,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             finally:
                 self.offload_queue.task_done()
 
-    def refresh(self, transfers: list[PoolTransfer]) -> None:
+    def refresh(self, transfers: list[PoolTransfer], reason: str = "") -> None:
         # Mooncake leases an object on an existence query that finds it and
         # evicts in lease order; a write grants no lease. This stage's objects
         # only: each stage refreshes what it put.
@@ -844,7 +846,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             keys = self.storage._tag_keys(keys)
             for i in range(len(pages)):
                 per_page[i].extend(keys[i * multiplier : (i + 1) * multiplier])
-        self.refresh_queue.put((pages, per_page))
+        self.refresh_queue.put((reason, pages, per_page))
 
     def refresh_thread_func(self) -> None:
         while True:
@@ -852,7 +854,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             try:
                 if task is None:
                     return
-                pages, per_page = task
+                reason, pages, per_page = task
                 flat = [key for keys in per_page for key in keys]
                 if not flat:
                     continue
@@ -868,6 +870,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                         pos += len(keys)
                     _trace_refresh(
                         storage=self.storage,
+                        reason=reason,
                         pages=pages,
                         objs=len(flat),
                         page_found=page_found,

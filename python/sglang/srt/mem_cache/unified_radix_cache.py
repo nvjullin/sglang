@@ -1206,6 +1206,8 @@ class UnifiedRadixCache(BasePrefixCache):
         """Evict one device leaf, consuming its step result; returns the
         deferred write-back BackupKV when one must run before the demote."""
         pre = _nf_id(self.tree_core, node_id) if _CT.on else ""
+        if self.linker is not None:
+            self.linker.note_device_evicted(node_id)
         result = self.tree_core.evict_device_leaf(node_id, self.is_write_back)
         self._apply_eviction_result(result)
         if self._tracks_write_through_unbacked_evictions():
@@ -4760,6 +4762,7 @@ class UnifiedRadixCache(BasePrefixCache):
         if self.linker is not None:
             self._check_linker_offloads()
             self.linker.check_prefetch_events()
+            self.linker.flush_refresh()
             return
 
         if self.enable_storage:

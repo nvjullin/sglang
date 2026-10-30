@@ -243,10 +243,11 @@ class UnifiedCacheLinker(ABC):
         when known; backends may attribute the stored objects to it.
         """
 
-    def refresh(self, transfers: list[PoolTransfer]) -> None:
-        """Mark these stored pages as just used: they left the device, so the
-        store now holds their only copy. A store that evicts by recency of use
-        would otherwise rank them by when they were written. No-op by default."""
+    def refresh(self, transfers: list[PoolTransfer], reason: str = "") -> None:
+        """Mark these stored pages as just used (``reason``: ``evict`` when they
+        left the device, ``hit`` when a request matched them on the device). A
+        store that evicts by recency of use would otherwise rank them by when
+        they were written, since it never sees device hits. No-op by default."""
 
     @abstractmethod
     def num_completed_offloads(self) -> int:
@@ -338,7 +339,16 @@ class UnifiedCacheLinkerWrapper:
         self._refresh_on_evict = (
             os.environ.get("SGLANG_LINKER_REFRESH_ON_DEVICE_EVICT", "0") == "1"
         )
-        self._evicted_hashes: list[str] = []
+        self._refresh_on_hit = (
+            os.environ.get("SGLANG_LINKER_REFRESH_ON_DEVICE_HIT", "0") == "1"
+        )
+        # A device-hit page is refreshed at most once per interval.
+        self._refresh_interval = float(
+            os.environ.get("SGLANG_LINKER_REFRESH_INTERVAL_S", "60")
+        )
+        self._refresh_hashes: dict[str, list[str]] = {"evict": [], "hit": []}
+        self._last_hit_refresh: dict[str, float] = {}
+        self._last_prune = 0.0
         # Trace-only state: last tail (anchored, dev, pages) written per rid,
         # lookup count for the sampled hash check, and submit time per offloaded node.
         # The anchor mode is part of the key: an anchored and an unanchored tail
@@ -366,6 +376,8 @@ class UnifiedCacheLinkerWrapper:
         key, _ = key.maybe_to_bigram_view(cache.tree_core.is_eagle)
         page = cache.page_size
         device_hit_len = result.device_prefix_len
+        if self._refresh_on_hit and device_hit_len > 0:
+            self._note_device_hit(result.last_device_node)
         if device_hit_len >= len(key):
             if _CT.on:
                 _CT.emit(
@@ -705,21 +717,45 @@ class UnifiedCacheLinkerWrapper:
         offload has finished (a pending one holds a lock); a failed one's pages
         are simply not found."""
         if self._refresh_on_evict:
-            self._evicted_hashes.extend(self.cache.tree_core.get_hash_values(node_id))
+            self._refresh_hashes["evict"].extend(
+                self.cache.tree_core.get_hash_values(node_id)
+            )
+
+    def _note_device_hit(self, node_id: NodeId) -> None:
+        tree_core = self.cache.tree_core
+        hashes = tree_core.get_prefix_hash_values(node_id) + tree_core.get_hash_values(
+            node_id
+        )
+        now = time.monotonic()
+        horizon = now - self._refresh_interval
+        last = self._last_hit_refresh
+        due = [h for h in hashes if last.get(h, horizon) <= horizon]
+        for h in due:
+            last[h] = now
+        self._refresh_hashes["hit"].extend(due)
 
     def flush_refresh(self) -> None:
-        if not self._evicted_hashes:
-            return
-        hashes, self._evicted_hashes = self._evicted_hashes, []
-        transfers = []
-        for component in self._components:
-            transfer = component.build_external_linker_transfer(
-                LinkerTransferPhase.LOOKUP, None, hashes
-            )
-            if transfer is None:
-                return
-            transfers.append(transfer)
-        self.cache_linker.refresh(transfers)
+        now = time.monotonic()
+        if now - self._last_prune > self._refresh_interval:
+            horizon = now - self._refresh_interval
+            self._last_hit_refresh = {
+                h: t for h, t in self._last_hit_refresh.items() if t > horizon
+            }
+            self._last_prune = now
+        for reason, hashes in self._refresh_hashes.items():
+            if not hashes:
+                continue
+            self._refresh_hashes[reason] = []
+            transfers = []
+            for component in self._components:
+                transfer = component.build_external_linker_transfer(
+                    LinkerTransferPhase.LOOKUP, None, hashes
+                )
+                if transfer is None:
+                    break
+                transfers.append(transfer)
+            else:
+                self.cache_linker.refresh(transfers, reason)
 
     # ---- offload: device -> remote, driven by the write-through chain ----
 

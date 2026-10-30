@@ -243,6 +243,11 @@ class UnifiedCacheLinker(ABC):
         when known; backends may attribute the stored objects to it.
         """
 
+    def refresh(self, transfers: list[PoolTransfer]) -> None:
+        """Mark these stored pages as just used: they left the device, so the
+        store now holds their only copy. A store that evicts by recency of use
+        would otherwise rank them by when they were written. No-op by default."""
+
     @abstractmethod
     def num_completed_offloads(self) -> int:
         """Return the number of completed offloads waiting to be consumed."""
@@ -328,6 +333,12 @@ class UnifiedCacheLinkerWrapper:
         self.pending_offloads: list[_PendingOffload] = []
         # Page-aligned radix-key prefix excluded from offload during an insert.
         self.offload_skip_prefix_len = 0
+        # Page hashes of stored nodes evicted from the device since the last
+        # flush_refresh; prototype switch, off unless the env var is 1.
+        self._refresh_on_evict = (
+            os.environ.get("SGLANG_LINKER_REFRESH_ON_DEVICE_EVICT", "0") == "1"
+        )
+        self._evicted_hashes: list[str] = []
         # Trace-only state: last tail (anchored, dev, pages) written per rid,
         # lookup count for the sampled hash check, and submit time per offloaded node.
         # The anchor mode is part of the key: an anchored and an unanchored tail
@@ -686,6 +697,29 @@ class UnifiedCacheLinkerWrapper:
             if transfer is not None:
                 result.append(transfer)
         return result
+
+    # ---- refresh: tell the store which stored pages just left the device ----
+
+    def note_device_evicted(self, node_id: NodeId) -> None:
+        """Call before the node's device value is freed. An evictable node's
+        offload has finished (a pending one holds a lock); a failed one's pages
+        are simply not found."""
+        if self._refresh_on_evict:
+            self._evicted_hashes.extend(self.cache.tree_core.get_hash_values(node_id))
+
+    def flush_refresh(self) -> None:
+        if not self._evicted_hashes:
+            return
+        hashes, self._evicted_hashes = self._evicted_hashes, []
+        transfers = []
+        for component in self._components:
+            transfer = component.build_external_linker_transfer(
+                LinkerTransferPhase.LOOKUP, None, hashes
+            )
+            if transfer is None:
+                return
+            transfers.append(transfer)
+        self.cache_linker.refresh(transfers)
 
     # ---- offload: device -> remote, driven by the write-through chain ----
 

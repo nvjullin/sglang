@@ -6,10 +6,8 @@ Usage (run from sglang-source/test/manual/):
 
 Per (prompt, step) the comparator finds the intersection of main's top-K
 token IDs with branch's top-K, looks up the logprob each side assigned to
-each common token, and computes:
-  - cosine similarity (log-prob vector dot product / norm product)
-  - mean absolute difference
-  - mean relative difference (denominator: max(|main|, eps))
+each common token, and computes their mean absolute difference (nats).
+Steps with fewer than 2 common tokens have no value (NaN) and are left out.
 
 These per-step scalars are aggregated into mean/p50/p90/p99/min/max.
 The intersection size (`common_topk_count`) per step is also reported - if
@@ -32,8 +30,8 @@ def _per_step_metrics(
     main_top_lps: np.ndarray,  # float32 [K]
     branch_top_ids: np.ndarray,  # int32 [K]
     branch_top_lps: np.ndarray,  # float32 [K]
-) -> Tuple[float, float, float, int]:
-    """Return (cos, mean_abs, mean_rel, common_count)."""
+) -> Tuple[float, int]:
+    """Return (mean_abs, common_count)."""
     branch_lookup: Dict[int, float] = {
         int(t): float(lp) for t, lp in zip(branch_top_ids, branch_top_lps)
     }
@@ -47,20 +45,11 @@ def _per_step_metrics(
 
     common = len(common_main_lps)
     if common < 2:
-        return float("nan"), float("nan"), float("nan"), common
+        return float("nan"), common
 
     m = np.asarray(common_main_lps, dtype=np.float64)
     b = np.asarray(common_branch_lps, dtype=np.float64)
-    nm, nb = np.linalg.norm(m), np.linalg.norm(b)
-    if nm == 0.0 or nb == 0.0:
-        cos = 1.0
-    else:
-        cos = float(np.dot(m, b) / (nm * nb))
-
-    abs_d = np.abs(m - b)
-    mean_abs = float(abs_d.mean())
-    mean_rel = float((abs_d / np.maximum(np.abs(m), 1e-9)).mean())
-    return cos, mean_abs, mean_rel, common
+    return float(np.abs(m - b).mean()), common
 
 
 def _aggregate(values: List[float]) -> Dict[str, float]:
@@ -99,9 +88,7 @@ def main() -> None:
 
     record_by_idx = {p["idx"]: p for p in record_meta["prompts"]}
 
-    cos_all: List[float] = []
     abs_all: List[float] = []
-    rel_all: List[float] = []
     common_all: List[float] = []
     per_prompt: List[Dict[str, Any]] = []
 
@@ -132,31 +119,23 @@ def main() -> None:
         main_top_ids = main_a["top_k_token_ids"].numpy()
         branch_top_ids = branch_a["top_k_token_ids"].numpy()
 
-        prompt_cos: List[float] = []
         prompt_abs: List[float] = []
-        prompt_rel: List[float] = []
         for s in range(n_steps):
-            cos, mabs, mrel, common = _per_step_metrics(
+            mabs, common = _per_step_metrics(
                 main_top_ids[s],
                 main_top_lps_f32[s],
                 branch_top_ids[s],
                 branch_top_lps_f32[s],
             )
-            cos_all.append(cos)
             abs_all.append(mabs)
-            rel_all.append(mrel)
             common_all.append(float(common))
-            prompt_cos.append(cos)
             prompt_abs.append(mabs)
-            prompt_rel.append(mrel)
 
         per_prompt.append(
             {
                 "idx": idx,
                 "n_steps": n_steps,
-                "cosine": _aggregate(prompt_cos),
                 "abs_diff": _aggregate(prompt_abs),
-                "rel_diff": _aggregate(prompt_rel),
             }
         )
 
@@ -166,9 +145,7 @@ def main() -> None:
         "record_server_args": record_meta.get("server_args"),
         "branch_server_args": branch_meta.get("server_args"),
         "topk": record_meta.get("topk_logprobs"),
-        "cosine_similarity": _aggregate(cos_all),
         "mean_abs_diff": _aggregate(abs_all),
-        "mean_rel_diff": _aggregate(rel_all),
         "common_topk_count": _aggregate(common_all),
         "failed_steps": branch_meta.get("failed_steps", []),
         "per_prompt": per_prompt,
@@ -179,13 +156,11 @@ def main() -> None:
         json.dump(summary, f, indent=2)
     print(f"[branch_compare] wrote {summary_path}")
 
-    # Terminal histograms (also archived to histograms.txt). Three panels
+    # Terminal histograms (also archived to histograms.txt). The panels
     # share the same width / bin count for easy visual comparison.
     hist_text = _render_histograms(
         [
-            ("Cosine similarity", cos_all, summary["cosine_similarity"]),
             ("Mean abs diff", abs_all, summary["mean_abs_diff"]),
-            ("Mean relative diff", rel_all, summary["mean_rel_diff"]),
             ("Common top-K count", common_all, summary["common_topk_count"]),
         ],
         n_bins=24,

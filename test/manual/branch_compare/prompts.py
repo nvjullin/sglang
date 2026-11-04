@@ -1,10 +1,10 @@
 """Prompt loading for branch_compare.
 
 Two paths:
-  1. --eval-name {gpqa, mmlu, gsm8k, math, humaneval, mgsm, aime25,
-     longbench_v2}: instantiate the eval class from sglang.test.simple_eval_*
-     and run it with a RecordingSampler (returns dummy text, captures the
-     message_list). The captured messages become the prompts.
+  1. --eval-name NAME: run the eval with a RecordingSampler (returns empty
+     text, captures each message list) and use the captured messages as the
+     prompts. Most evals come from sgl-eval (the `test` extra of
+     python/pyproject.toml); humaneval and mgsm from sglang.test.simple_eval_*.
   2. --prompts-file FILE: JSONL with `{"prompt": "..."}` per line.
 
 For --api chat we render the captured messages through the model's chat
@@ -22,6 +22,11 @@ from typing import Any, Dict, List, Optional
 
 from sglang.test.simple_eval_common import SamplerBase
 
+# Text-only sgl-eval benchmarks.
+SGL_EVAL_NAMES = ("gsm8k", "mmlu", "mmlu_pro", "gpqa", "aime24", "aime25", "aime26")
+SIMPLE_EVAL_NAMES = ("humaneval", "mgsm")
+EVAL_NAMES = SGL_EVAL_NAMES + SIMPLE_EVAL_NAMES
+
 
 @dataclass
 class Prompt:
@@ -32,82 +37,55 @@ class Prompt:
 
 
 class RecordingSampler(SamplerBase):
-    """Captures every message_list passed in __call__, returns empty text.
+    """Captures every message list an eval sends and answers with empty text.
 
-    Used to extract prompts from sglang.test.simple_eval_* classes without
-    actually running their grading.
+    Speaks both sampler protocols: sglang.test.simple_eval_* call
+    `sampler(messages) -> str`; sgl-eval calls `sampler(messages, gen) -> Sample`
+    and expects the sampler to prepend `gen.system_message`.
     """
 
     def __init__(self):
         self.captured: List[List[Dict[str, Any]]] = []
-        self.model = "branch-compare-recording-sampler"
-        # Some evals look up `_completion_tokens` on the sampler.
-        self._completion_tokens: List[int] = []
 
-    def __call__(self, message_list):
+    def __call__(self, message_list, gen=None):
+        if gen is None:
+            self.captured.append(message_list)
+            return ""
+        from sgl_eval.types import Sample
+
+        if gen.system_message:
+            message_list = [
+                {"role": "system", "content": gen.system_message},
+                *message_list,
+            ]
         self.captured.append(message_list)
-        return ""
-
-    # Some evals expect ChatCompletionSampler-shaped helpers:
-    def _pack_message(self, role: str, content: Any) -> Dict[str, Any]:
-        return {"role": role, "content": content}
+        return Sample(text="")
 
 
-def _load_eval(eval_name: str, num_examples: int, num_threads: int = 1):
-    """Mirror of the eval-name dispatch in sglang.test.run_eval."""
-    if eval_name == "mmlu":
-        from sglang.test.simple_eval_mmlu import MMLUEval
-
-        return MMLUEval(
-            "https://openaipublic.blob.core.windows.net/simple-evals/mmlu.csv",
-            num_examples,
-            num_threads,
-        )
-    if eval_name == "gpqa":
-        from sglang.test.simple_eval_gpqa import GPQAEval
-
-        return GPQAEval(
-            "https://openaipublic.blob.core.windows.net/simple-evals/gpqa_diamond.csv",
-            num_examples,
-            num_threads,
-        )
-    if eval_name == "math":
-        from sglang.test.simple_eval_common import ChatCompletionSampler
-        from sglang.test.simple_eval_math import MathEval
-
-        # Math eval needs a checker; supply a stub that always says equal.
-        # We never run the grading anyway (RecordingSampler captures and bails).
-        return MathEval(
-            "https://openaipublic.blob.core.windows.net/simple-evals/math_test.csv",
-            ChatCompletionSampler(model="gpt-4-turbo"),
-            num_examples,
-            num_threads,
-        )
-    if eval_name == "gsm8k":
-        from sglang.test.simple_eval_gsm8k import GSM8KEval
-
-        return GSM8KEval(num_examples=num_examples, num_threads=num_threads)
+def _simple_eval_runner(eval_name: str, num_examples: int):
     if eval_name == "humaneval":
         from sglang.test.simple_eval_humaneval import HumanEval
 
-        return HumanEval(num_examples, num_threads)
+        return HumanEval(num_examples, num_threads=1)
     if eval_name == "mgsm":
         from sglang.test.simple_eval_mgsm import MGSMEval
 
-        return MGSMEval(num_examples, num_threads)
-    if eval_name == "aime25":
-        from sglang.test.simple_eval_aime25 import AIME25Eval
-
-        return AIME25Eval(num_examples, num_threads)
-    if eval_name == "longbench_v2":
-        from sglang.test.simple_eval_longbench_v2 import LongBenchV2Eval
-
-        return LongBenchV2Eval(
-            data_source="THUDM/LongBench-v2",
-            num_examples=num_examples,
-            num_threads=num_threads,
-        )
+        return MGSMEval(num_examples, num_threads=1)
     raise ValueError(f"Unsupported eval_name: {eval_name}")
+
+
+def _sgl_eval_runner(eval_name: str, num_examples: int):
+    from sgl_eval.registry import get
+
+    spec = get(eval_name)
+    # One thread keeps the captured order equal to the dataset order.
+    return lambda sampler: spec.run(
+        sampler=sampler,
+        gen=spec.default_gen,
+        n_repeats=1,
+        num_examples=num_examples,
+        num_threads=1,
+    )
 
 
 def _capture_messages_via_eval(
@@ -115,10 +93,13 @@ def _capture_messages_via_eval(
 ) -> List[List[Dict[str, Any]]]:
     """Run the eval with a RecordingSampler. Grading runs on dummy responses
     and may print warnings; we only need the captured message_lists."""
-    eval_obj = _load_eval(eval_name, num_examples, num_threads=1)
+    if eval_name in SGL_EVAL_NAMES:
+        run_eval = _sgl_eval_runner(eval_name, num_examples)
+    else:
+        run_eval = _simple_eval_runner(eval_name, num_examples)
     sampler = RecordingSampler()
     try:
-        eval_obj(sampler)
+        run_eval(sampler)
     except Exception:
         # Some evals try to grade dummy outputs and crash on the empty string;
         # whatever was captured before the crash is still usable.

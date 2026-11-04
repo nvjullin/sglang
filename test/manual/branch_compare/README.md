@@ -2,7 +2,7 @@
 
 Compares per-step logit/logprob distributions between a **record** run on
 the **baseline** (typically `main`) and a **verify** run on a feature
-branch. The verify run is forced (via the `forced_token_ids` debug
+branch. The verify run is forced (via the forced-token-ids debug
 feature) to emit exactly the baseline's token sequence at every step, so
 prefill and decode are both exercised on the branch with comparable
 inputs and small kernel differences show up as small distribution drift
@@ -10,16 +10,25 @@ instead of catastrophic prefix divergence.
 
 ## Prerequisites
 
-The test relies on the `forced_token_ids` debug feature in sglang core:
-- `SamplingParams.forced_token_ids` / `forced_token_ids_path`
+The test relies on the forced-token-ids debug feature in sglang core:
+- request transport in `sampling_params.custom_params`: `__sglang_forced_token_ids`
+  (a list of token ids) or `__sglang_forced_token_ids_path` (a server-side
+  torch file; see `FORCED_TOKEN_IDS_KEY` in `sglang/srt/sampling/sampling_params.py`)
 - `SamplingBatchInfo.prepare_forced_next_token_ids`
 - `Sampler.forward` override step
 
 These must be present on **both** branches under test.
 
 Set `SGLANG_ENABLE_FORCED_TOKEN_IDS=1` in the server's environment for both
-phases. Without the env var, `forced_token_ids` requests are rejected at
-admission with no disk I/O.
+phases. Without the env var, forced-token requests are rejected at
+admission with no disk I/O. The server forces `--disable-overlap-schedule`
+while it is set.
+
+`--eval-name` takes prompts from [sgl-eval](https://github.com/sgl-project/sgl-eval)
+(gsm8k, mmlu, mmlu_pro, gpqa, aime24/25/26), so install it in the client
+environment (`pip install sgl-eval`, version pinned in the `test` extra of
+`python/pyproject.toml`); humaneval and mgsm come from
+`sglang.test.simple_eval_*`. `--prompts-file` needs neither.
 
 ## Workflow
 

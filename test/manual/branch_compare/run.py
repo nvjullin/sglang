@@ -35,6 +35,8 @@ import requests
 from branch_compare import artifacts
 from branch_compare import prompts as prompts_mod
 
+from sglang.srt.environ import envs
+from sglang.srt.sampling.sampling_params import FORCED_TOKEN_IDS_PATH_KEY
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import popen_launch_server
@@ -73,16 +75,8 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument(
         "--eval-name",
         default=None,
-        choices=[
-            "mmlu",
-            "gpqa",
-            "math",
-            "gsm8k",
-            "humaneval",
-            "mgsm",
-            "aime25",
-            "longbench_v2",
-        ],
+        choices=prompts_mod.EVAL_NAMES,
+        help="Take prompts from this eval (sgl-eval for most; see prompts.py).",
     )
     g.add_argument("--num-examples", type=int, default=16)
     g.add_argument(
@@ -267,7 +261,7 @@ def _build_sampling_params(
     if args.seed is not None:
         sp["sampling_seed"] = args.seed
     if forced_path is not None:
-        sp["forced_token_ids_path"] = forced_path
+        sp["custom_params"] = {FORCED_TOKEN_IDS_PATH_KEY: forced_path}
     return sp
 
 
@@ -308,7 +302,7 @@ def cmd_record(args: argparse.Namespace, base_url: str) -> None:
             args.artifact_dir, i, out_ids, top_ids, top_lps, chosen_lp
         )
         print(
-            f"  [{i+1}/{n}] {len(out_ids)} steps, finish={finish}, {dt:.1f}s",
+            f"  [{i + 1}/{n}] {len(out_ids)} steps, finish={finish}, {dt:.1f}s",
             flush=True,
         )
         return {
@@ -404,13 +398,13 @@ def cmd_verify(args: argparse.Namespace, base_url: str) -> None:
             )
             mismatch = {"prompt_idx": idx, "first_mismatch_step": mismatch_step}
             print(
-                f"  [{idx+1}/{n}] FORCED-TOKEN MISMATCH at step "
+                f"  [{idx + 1}/{n}] FORCED-TOKEN MISMATCH at step "
                 f"{mismatch_step}: forcing did not take.",
                 flush=True,
             )
         else:
             print(
-                f"  [{idx+1}/{n}] {len(out_ids)} steps OK, finish={finish}, "
+                f"  [{idx + 1}/{n}] {len(out_ids)} steps OK, finish={finish}, "
                 f"{dt:.1f}s",
                 flush=True,
             )
@@ -494,11 +488,11 @@ def main() -> None:
             del server_other_args[i : i + 2]
         env = os.environ.copy()
         # Surface the env-var requirement so users who forget get a clear error.
-        if env.get("SGLANG_ENABLE_FORCED_TOKEN_IDS") != "1":
+        if not envs.SGLANG_ENABLE_FORCED_TOKEN_IDS.get():
             print(
                 "[branch_compare] WARNING: SGLANG_ENABLE_FORCED_TOKEN_IDS is "
                 "not set in the environment. The server will reject "
-                "forced_token_ids requests on the verify phase.",
+                "forced-token requests on the verify phase.",
                 file=sys.stderr,
             )
         proc = popen_launch_server(

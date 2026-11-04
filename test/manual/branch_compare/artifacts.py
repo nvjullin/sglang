@@ -4,9 +4,9 @@ Layout under <artifact-dir>:
     meta.json        - global metadata + per-prompt index
     prompt_<i>.pt    - per-request torch tensors (output_ids + top-K)
 
-The per-request file format is also what the server's
-`forced_token_ids_path` loader reads on the verify phase: it accepts a
-dict with an "output_ids" key (1-D int tensor) or a bare 1-D int tensor.
+The per-request file format is also what the server's forced-token-ids
+path loader reads on the verify phase: it accepts a dict with an
+"output_ids" key (1-D int tensor) or a bare 1-D int tensor.
 """
 
 from __future__ import annotations
@@ -46,7 +46,7 @@ def write_prompt_artifact(
     """Write a per-request torch artifact.
 
     Tensors:
-      output_ids:        int64 [N]      (also serves as forced_token_ids on verify)
+      output_ids:        int64 [N]      (also the forced token ids on verify)
       top_k_token_ids:   int32 [N, K]
       top_k_logprobs:    bf16  [N, K]
       chosen_logprob:    bf16  [N]
@@ -84,8 +84,8 @@ def read_prompt_artifact(artifact_dir: str, idx: int) -> Dict[str, torch.Tensor]
 
 
 def absolute_logprobs_path(record_dir: str, idx: int) -> str:
-    """Return the absolute path the verify phase passes as
-    sampling_params.forced_token_ids_path. The server reads this file at
-    request admission and pulls out the `output_ids` 1-D tensor.
+    """Return the absolute path the verify phase passes as the forced-token-ids
+    path. The server reads this file at request admission and pulls out the
+    `output_ids` 1-D tensor.
     """
     return os.path.abspath(os.path.join(record_dir, prompt_filename(idx)))

@@ -2,6 +2,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.runtime_context import get_context
@@ -30,6 +31,7 @@ class TestHiddenStateServerMode(CustomTestCase):
             joint_head_config=None, pointer_head=None
         )
         manager.server_args = SimpleNamespace(enable_custom_logit_processor=False)
+        manager.disaggregation_mode = DisaggregationMode.NULL
         manager._validate_token_ids_logprob = Mock()
         return manager
 

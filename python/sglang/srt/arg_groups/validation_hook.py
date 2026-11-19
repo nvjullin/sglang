@@ -20,7 +20,11 @@ from sglang.srt.arg_groups.choices import (
     WATERMARK_ALGORITHM_CHOICES,
     removed_choice_message,
 )
-from sglang.srt.arg_groups.model_override_base import resolved_view, resolving_view
+from sglang.srt.arg_groups.model_override_base import (
+    model_config_of,
+    resolved_view,
+    resolving_view,
+)
 from sglang.srt.arg_groups.overrides import (
     _hisparse_validation,
     declare_resolution,
@@ -1022,6 +1026,47 @@ def validate_sampling_mask_max_tokens(server_args: Any):
         raise ValueError(
             "--sampling-mask-max-tokens must be positive "
             f"(got {cfg.sampling_mask_max_tokens})."
+        )
+
+
+# Speculative algorithms whose verify forces tokens (eagle_sample); others would
+# silently run free.
+_FORCED_TOKEN_IDS_SPEC_ALGORITHMS = ("EAGLE", "EAGLE3")
+
+
+def validate_forced_token_ids(server_args: Any):
+    """SGLANG_ENABLE_FORCED_TOKEN_IDS: refuse configs that would emit unforced tokens."""
+    if not envs.SGLANG_ENABLE_FORCED_TOKEN_IDS.get():
+        return
+    from sglang.srt.configs.model_config import UNLIMITED_OCR_V2_ARCH
+    from sglang.srt.platforms import current_platform
+
+    cfg = resolving_view(server_args)
+    reasons = []
+    algorithm = cfg.speculative_algorithm
+    if algorithm is not None:
+        if algorithm.upper() not in _FORCED_TOKEN_IDS_SPEC_ALGORITHMS:
+            reasons.append(
+                f"--speculative-algorithm {algorithm} (supported: "
+                f"{', '.join(_FORCED_TOKEN_IDS_SPEC_ALGORITHMS)})"
+            )
+        if current_platform.is_out_of_tree():
+            reasons.append("an out-of-tree platform's speculative worker")
+        if cfg.speculative_use_rejection_sampling:
+            reasons.append("speculative rejection sampling")
+        if envs.SGLANG_SIMULATE_ACC_LEN.get() > 0:
+            reasons.append("SGLANG_SIMULATE_ACC_LEN (it overrides acceptance)")
+    if cfg.dllm_algorithm is not None:
+        reasons.append("--dllm-algorithm (it emits tokens without the sampler)")
+    # Its decode graph relays the in-graph argmax to the next step's input.
+    architectures = model_config_of(server_args).hf_config.architectures or ()
+    if UNLIMITED_OCR_V2_ARCH in architectures:
+        reasons.append("Unlimited-OCR v2")
+    if reasons:
+        raise ValueError(
+            "SGLANG_ENABLE_FORCED_TOKEN_IDS=1 cannot force tokens with: "
+            + "; ".join(reasons)
+            + "."
         )
 
 

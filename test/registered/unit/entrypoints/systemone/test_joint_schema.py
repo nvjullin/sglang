@@ -17,6 +17,7 @@ import torch
 from PIL import Image
 from transformers import AutoTokenizer
 
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.entrypoints import http_server
 from sglang.srt.entrypoints.openai.protocol import DecisionRequest
 from sglang.srt.entrypoints.openai.serving_decisions import OpenAIServingDecisions
@@ -387,6 +388,7 @@ def _admission_manager(joint_head_config):
     # A layout must be refused before auto-truncation could cut its prompt.
     manager.allow_auto_truncate = True
     manager.validate_total_tokens = False
+    manager.disaggregation_mode = DisaggregationMode.NULL
     manager._validate_token_ids_logprob = mock.Mock()
     return manager
 

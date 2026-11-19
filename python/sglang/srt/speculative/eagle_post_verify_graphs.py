@@ -143,6 +143,8 @@ class EaglePostVerifyGraphs:
                 batch.return_logprob
                 and logits_output.next_token_logits_vocab_shard is not None
             )
+            # the graphs have no static input for forced ids
+            or info.forced_token_ids is not None
         ):
             return None
         return (
@@ -268,6 +270,7 @@ def _sample(slot: SimpleNamespace, speculative_runtime_hooks: Any) -> tuple:
         logit_bias=None,
         sampling_seed=None,
         watermark=None,
+        forced_token_ids=None,
         is_all_greedy=slot.is_all_greedy,
         need_top_k_sampling=slot.need_top_k,
         need_top_p_sampling=slot.need_top_p,

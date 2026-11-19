@@ -5473,13 +5473,6 @@ class Scheduler(
             )
             batch.sampling_info.set_plugin_state(batch.reqs)
             batch.sampling_info.set_seeds_and_mask_rows(batch.reqs)
-            # Refresh per-forward forced-token slots (no-op when no request has
-            # forced_token_ids set). Must run after set_plugin_state, which builds
-            # the forced lists, and before copy_for_forward so the tensor rides
-            # into the worker copy.
-            if batch.sampling_info.has_any_forced:
-                current_steps = [len(r.output_ids) for r in batch.reqs]
-                batch.sampling_info.prepare_forced_next_token_ids(current_steps)
             if self.enable_overlap:
                 # Self-gates on batch.spec_info.future_indices; non-spec_v2
                 # no-ops (ForwardBatch.init_new lazily computes the sum).

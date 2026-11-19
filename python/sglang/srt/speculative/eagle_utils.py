@@ -37,6 +37,7 @@ from sglang.srt.mem_cache.allocation_sizing import (
     page_aligned_decode_alloc_lens,
 )
 from sglang.srt.runtime_context import get_spec
+from sglang.srt.sampling.forced_token_ids import force_probs_, force_tokens
 from sglang.srt.speculative.sharded_verify import (
     VocabShard,
     gather_full_logits,
@@ -909,6 +910,15 @@ def eagle_sample(
 
     sanitize_nan_logits(next_token_logits, "verify: target model logits")
 
+    # Forced-token-ids debug feature: per verify row, the forced id or NOT_FORCED.
+    forced_tokens = (
+        sampling_info.forced_token_ids.lookup(
+            verify_input.positions, rows_per_req=verify_input.draft_token_num
+        )
+        if sampling_info.forced_token_ids is not None
+        else None
+    )
+
     candidates = verify_input.draft_token.reshape(bs, verify_input.draft_token_num)
     adjust_verify_logits(
         next_token_logits,
@@ -946,6 +956,7 @@ def eagle_sample(
         simulated_acc_len_rng=simulated_acc_len_rng,
         sparse_bonus_argmax=sparse_bonus_argmax,
         local_keys=local_keys,
+        forced_tokens=forced_tokens,
     )
 
 
@@ -964,8 +975,10 @@ def _tree_accept(
     simulated_acc_len_rng: Optional[torch.Generator],
     sparse_bonus_argmax: bool,
     local_keys: Optional[LocalKeysFn],
+    forced_tokens: Optional[torch.Tensor] = None,
 ):
-    """A gather it still needs is published to ``logits_output``."""
+    """A gather it still needs is published to ``logits_output``. forced_tokens:
+    per verify row, the forced id or NOT_FORCED (SGLANG_ENABLE_FORCED_TOKEN_IDS)."""
     from sglang.srt.layers.dp_attention import (
         is_dp_attention_enabled,
     )
@@ -1045,6 +1058,8 @@ def _tree_accept(
             if sharded_predict is None
             else sharded_predict
         )
+        if forced_tokens is not None:
+            target_predict = force_tokens(target_predict, forced_tokens)
         target_predict = target_predict.reshape(bs, verify_input.draft_token_num)
         if fused_verify:
             accept_lens, accept_index = _chain_accept(
@@ -1088,7 +1103,10 @@ def _tree_accept(
     elif vocab_shard is not None:
         # temperature-only rows: a Gumbel-max target sample per row, then the greedy
         # check against it (exact for a topk-1 chain, whose drafts are deterministic)
-        target_predict = sharded_predict.reshape(bs, verify_input.draft_token_num)
+        target_predict = sharded_predict
+        if forced_tokens is not None:
+            target_predict = force_tokens(target_predict, forced_tokens)
+        target_predict = target_predict.reshape(bs, verify_input.draft_token_num)
         if fused_verify:
             _chain_accept(
                 predict=predict,
@@ -1125,6 +1143,8 @@ def _tree_accept(
             verify_width=verify_input.draft_token_num,
             max_top_k=uno_target_max_top_k,
         )
+        if forced_tokens is not None:
+            target_predict = force_tokens(target_predict, forced_tokens)
         if fused_verify:
             _chain_accept(
                 predict=predict,
@@ -1190,6 +1210,10 @@ def _tree_accept(
                     sampling_info.min_ps, verify_input.draft_token_num, dim=0
                 ),
             )
+        if forced_tokens is not None:
+            # The kernel never accepts a draft without target mass and samples the
+            # bonus from relu(target - draft), so a one-hot row emits its forced id.
+            force_probs_(target_probs, forced_tokens)
         target_probs = target_probs.reshape(bs, verify_input.draft_token_num, -1)
         draft_probs = (
             verify_input.draft_probs

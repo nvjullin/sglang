@@ -51,8 +51,8 @@ def write_prompt_artifact(
       input_ids:         int64 [P]      (the prompt; verify replays the record's)
       output_ids:        int64 [N]      (also the forced token ids on verify)
       top_k_token_ids:   int32 [N, K]
-      top_k_logprobs:    bf16  [N, K]
-      chosen_logprob:    bf16  [N]
+      top_k_logprobs:    fp32  [N, K]   (bf16 would hide differences below its step)
+      chosen_logprob:    fp32  [N]
     """
     n = len(output_ids)
     if n == 0:
@@ -69,13 +69,11 @@ def write_prompt_artifact(
             else torch.zeros((n, 0), dtype=torch.int32)
         ),
         "top_k_logprobs": (
-            torch.tensor(top_k_logprobs, dtype=torch.float32).to(torch.bfloat16)
+            torch.tensor(top_k_logprobs, dtype=torch.float32)
             if k > 0
-            else torch.zeros((n, 0), dtype=torch.bfloat16)
+            else torch.zeros((n, 0), dtype=torch.float32)
         ),
-        "chosen_logprob": torch.tensor(chosen_logprob, dtype=torch.float32).to(
-            torch.bfloat16
-        ),
+        "chosen_logprob": torch.tensor(chosen_logprob, dtype=torch.float32),
     }
     path = os.path.join(artifact_dir, prompt_filename(idx))
     torch.save(out, path)

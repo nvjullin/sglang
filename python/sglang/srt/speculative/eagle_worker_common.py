@@ -243,6 +243,7 @@ def make_post_verify_io(
             has_watermark_candidates=bool(sampling_info.has_watermark_candidates),
             max_top_k=sampling_info.max_top_k,
             device=torch.device(device),
+            forced_token_ids=sampling_info.forced_token_ids,
         ),
         grammar_mask=grammar_mask,
         watermark=watermark,

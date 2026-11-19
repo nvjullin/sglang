@@ -247,6 +247,9 @@ class VerifySamplingView(msgspec.Struct, frozen=True):
     has_watermark_candidates: bool
     max_top_k: Optional[int]
     device: torch.device
+    # sglang.srt.sampling.forced_token_ids.ForcedTokenIds (SGLANG_ENABLE_FORCED_TOKEN_IDS
+    # debug feature), read by the stock verifier; None when no request is forced.
+    forced_token_ids: Optional[Any] = None
 
     @property
     def acc_additive_penalties(self) -> Optional[torch.Tensor]:

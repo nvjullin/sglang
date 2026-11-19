@@ -159,8 +159,10 @@ class ForcedTokenIds(msgspec.Struct, frozen=True):
 
 
 def force_tokens(tokens: torch.Tensor, forced: torch.Tensor) -> torch.Tensor:
-    """``tokens`` with every row that has a forced id replaced by it."""
-    return torch.where(forced.ge(0), forced.to(tokens.dtype).view_as(tokens), tokens)
+    """``tokens`` with every row that has a forced id replaced by it; ``forced`` is
+    flat and ``tokens`` any shape of the same numel (e.g. [bs, draft_token_num])."""
+    forced = forced.view(tokens.shape)
+    return torch.where(forced.ge(0), forced.to(tokens.dtype), tokens)
 
 
 def force_probs_(probs: torch.Tensor, forced: torch.Tensor) -> None:

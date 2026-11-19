@@ -207,7 +207,10 @@ def _load_forced_token_ids(path: str) -> List[int]:
 
 
 def _verify_forced_token_ids(
-    custom_params: Optional[Dict[str, CustomParamValue]], vocab_size: int
+    custom_params: Optional[Dict[str, CustomParamValue]],
+    *,
+    vocab_size: int,
+    beam_width: Optional[int],
 ) -> None:
     if not isinstance(custom_params, dict):
         return
@@ -219,6 +222,9 @@ def _verify_forced_token_ids(
         raise ValueError(
             "forced token ids require SGLANG_ENABLE_FORCED_TOKEN_IDS=1 on the server."
         )
+    # Beam search picks tokens from captured logits, outside the sampler.
+    if beam_width is not None and beam_width > 1:
+        raise ValueError("forced token ids cannot be combined with beam_width > 1.")
     if token_ids is not None and has_path:
         raise ValueError(
             f"Only one of {FORCED_TOKEN_IDS_KEY} or {FORCED_TOKEN_IDS_PATH_KEY} "
@@ -431,7 +437,9 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
             vocab_size=vocab_size,
             strict=True,
         )
-        _verify_forced_token_ids(self.custom_params, vocab_size=vocab_size)
+        _verify_forced_token_ids(
+            self.custom_params, vocab_size=vocab_size, beam_width=self.beam_width
+        )
 
         grammars = [
             self.json_schema,

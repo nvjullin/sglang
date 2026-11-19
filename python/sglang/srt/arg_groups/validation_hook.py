@@ -994,8 +994,32 @@ def validate_forced_token_ids(server_args: Any):
             reasons.append("SGLANG_SIMULATE_ACC_LEN (it overrides acceptance)")
     if cfg.dllm_algorithm is not None:
         reasons.append("--dllm-algorithm (it emits tokens without the sampler)")
+    if (
+        cfg.sampling_backend is not None
+        and cfg.sampling_backend not in BUILT_IN_SAMPLING_BACKENDS
+    ):
+        reasons.append(f"the registered sampling backend {cfg.sampling_backend!r}")
+    model_config = model_config_of(server_args)
+    architectures = model_config.hf_config.architectures or ()
+    # sgl-nvidia-mega steps return logits that SGLang samples; the flag also routes
+    # MSA-registered architectures through the monokernel contract, which is unverified.
+    if cfg.enable_nvidia_megakernel:
+        from sglang.srt.kernel_plugins.amd.binding import msa_serves
+
+        if msa_serves(architectures):
+            reasons.append("--enable-nvidia-megakernel on an MSA-served architecture")
+    if cfg.enable_amd_monokernel:
+        reasons.append("--enable-amd-monokernel")
+    # Read the env, not use_mlx(), which also validates the MLX runtime.
+    if envs.SGLANG_USE_MLX.get():
+        reasons.append("the MLX worker (it samples in its own graph)")
+    # Rust admission skips SamplingParams.verify and the path transport.
+    if envs.SGLANG_RUST_SERVER.get():
+        reasons.append("SGLANG_RUST_SERVER")
+    # The forced index assumes the prompt has no encoder placeholders.
+    if model_config.is_encoder_decoder:
+        reasons.append("an encoder-decoder model")
     # Its decode graph relays the in-graph argmax to the next step's input.
-    architectures = model_config_of(server_args).hf_config.architectures or ()
     if UNLIMITED_OCR_V2_ARCH in architectures:
         reasons.append("Unlimited-OCR v2")
     if reasons:

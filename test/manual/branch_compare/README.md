@@ -26,9 +26,14 @@ process (prefill and decode under PD) for both phases. Without it, forced-token
 requests are rejected at admission with no disk I/O. With it, the server refuses
 to start on a config that would emit tokens without forcing them: speculative
 algorithms other than EAGLE/EAGLE3 (NEXTN counts as EAGLE),
-`--speculative-use-rejection-sampling`, `SGLANG_SIMULATE_ACC_LEN`, dLLM and
-Unlimited-OCR v2. Nothing else changes: the overlap scheduler, CUDA graphs, DP
-attention and the deployment's speculative settings stay as configured.
+`--speculative-use-rejection-sampling`, `SGLANG_SIMULATE_ACC_LEN`, dLLM,
+encoder-decoder models, Unlimited-OCR v2, registered (non-built-in) sampling
+backends, `--enable-amd-monokernel`, `--enable-nvidia-megakernel` on an
+architecture the MSA plugin serves, the MLX worker and the Rust ingress
+(`SGLANG_RUST_SERVER`); a forced
+request with `beam_width > 1` is rejected at admission. Nothing else changes:
+the overlap scheduler, CUDA graphs, DP attention and the deployment's
+speculative settings stay as configured.
 
 `--eval-name` takes prompts from [sgl-eval](https://github.com/sgl-project/sgl-eval)
 (gsm8k, mmlu, mmlu_pro, gpqa, aime24/25/26), so install it in the client
@@ -134,11 +139,14 @@ In `--out-dir`:
   difference (nats) over the tokens that are in both sides' top-K, aggregated
   as mean, p50, p90, p99, min, max and `n`; `common_topk_count`: per-step size
   of that intersection; `chosen_abs_diff`: per step, the absolute difference of
-  the emitted (forced) token's logprob; a per-prompt rollup; the steps where
-  verify-side `output_ids` deviated from record-side.
-- `verdict.json` — pass/fail under policy `branch_compare.v1`. It always fails on
-  a forced-token mismatch, on a record prompt missing from the verify, and when
-  no step has two common top-K tokens. `--max-mean-abs-diff`,
+  the emitted (forced) token's logprob; a per-prompt rollup; the prompts whose
+  tokens differ between the two sides.
+- `verdict.json` — pass/fail under policy `branch_compare.v1`. It always fails
+  when `--branch-dir` is not a verify artifact, when a prompt's `input_ids` or
+  `output_ids` differ between the two sides (or a side's logprob rows do not
+  match its output length; listed under `token_mismatches` in `summary.json`),
+  on a record prompt missing from the verify, and when no step has two common
+  top-K tokens. `--max-mean-abs-diff`,
   `--max-p99-abs-diff`, `--max-chosen-abs-diff-mean` and `--min-common-topk-frac`
   (mean common top-K / K) add threshold checks; each check is listed with its
   value and limit.
@@ -220,9 +228,9 @@ and a smaller K track the tokens that matter.
 - The forced-tokens path loader reads any path the (trusted) caller provides.
   Don't enable `SGLANG_ENABLE_FORCED_TOKEN_IDS=1` on a server exposed to
   untrusted clients.
-- PD disaggregation carries at most 128 top-K logprobs for the first output
-  token; a request asking for more is rejected at admission. The script
-  defaults to 128.
+- PD disaggregation carries at most `--disaggregation-max-top-logprobs-num`
+  (default 128) top-K logprobs for the first output token; the scheduler rejects
+  a request asking for more. The script defaults to 128.
 - Speculative decoding: EAGLE and EAGLE3 (single- and multi-layer) only; other
   algorithms are refused at startup. Batches with forced requests skip the
   optional EAGLE post-verify CUDA graphs (`SGLANG_ENABLE_EAGLE_POST_VERIFY_CUDA_GRAPH`)

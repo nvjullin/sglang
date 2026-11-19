@@ -16,12 +16,17 @@ from sglang.srt.sampling.custom_logit_processor import (
     UOCR_PAGE_GUARD_PROCESSOR,
     DisallowedTokensLogitsProcessor,
 )
+from sglang.srt.sampling.forced_token_ids import (
+    NOT_FORCED,
+    ForcedTokenIds,
+    force_probs_,
+)
 from sglang.srt.sampling.sampling_batch_info import (
     ProcessorEntry,
     SamplingBatchInfo,
     merge_bias_tensor,
 )
-from sglang.srt.sampling.sampling_params import TOP_K_ALL
+from sglang.srt.sampling.sampling_params import FORCED_TOKEN_IDS_KEY, TOP_K_ALL
 from sglang.test.test_utils import CustomTestCase
 
 VOCAB_SIZE = 32
@@ -991,6 +996,91 @@ class TestFromScheduleBatch(CustomTestCase):
         self.assertEqual(entry.indices.dtype, torch.long)
         # custom_params should be collected for all reqs
         self.assertEqual(len(info.custom_params), 2)
+
+
+def _forced_req(prompt_len, forced=None):
+    custom_params = None if forced is None else {FORCED_TOKEN_IDS_KEY: forced}
+    return SimpleNamespace(
+        origin_input_ids=[0] * prompt_len,
+        sampling_params=SimpleNamespace(custom_params=custom_params),
+    )
+
+
+class TestForcedTokenIds(CustomTestCase):
+    """The forced index of a token emitted from a logits row at KV position p is
+    p + 1 - prompt_len; the overlap scheduler, speculative verify and PD decode all
+    rely on it instead of a host step counter."""
+
+    def setUp(self):
+        reqs = [
+            _forced_req(prompt_len=4, forced=[10, 11, 12]),
+            _forced_req(prompt_len=3),
+            _forced_req(prompt_len=2, forced=[20, 21]),
+        ]
+        self.table = ForcedTokenIds.from_reqs(reqs, DEVICE)
+
+    def _lookup(self, positions, rows_per_req=1):
+        return self.table.lookup(torch.tensor(positions), rows_per_req).tolist()
+
+    def test_one_row_per_request(self):
+        N = NOT_FORCED
+        # Last prefill chunk (p = P - 1) emits forced index 0; trailing rows are DP
+        # padding and must be ignored.
+        self.assertEqual(self._lookup([3, 2, 1, 99, 99]), [10, N, 20])
+        # Decode at p = P: index 1.
+        self.assertEqual(self._lookup([4, 3, 2]), [11, N, 21])
+        # An earlier prefill chunk (p < P - 1) and indices past the end run free.
+        self.assertEqual(self._lookup([2, 3, 0]), [N, N, N])
+        self.assertEqual(self._lookup([7, 3, 3]), [N, N, N])
+
+    def test_verify_rows_follow_tree_depth(self):
+        N = NOT_FORCED
+        # D = 3 rows per request at seq_len + depth, seq_len excluding the bonus.
+        positions = [5, 6, 7, 9, 9, 9, 2, 3, 4]
+        self.assertEqual(
+            self._lookup(positions, rows_per_req=3), [12, N, N, N, N, N, 21, N, N]
+        )
+
+    def test_filter_and_merge_keep_rows_aligned(self):
+        """Merge pads the side without forced requests and filter drops the table
+        once no forced request is left."""
+        N = NOT_FORCED
+        info = _make_info(
+            batch_size=2,
+            forced_token_ids=ForcedTokenIds.from_reqs(
+                [_forced_req(prompt_len=4, forced=[10, 11]), _forced_req(4)], DEVICE
+            ),
+        )
+        info.merge_batch(_make_info(batch_size=2))
+        info.merge_batch(
+            _make_info(
+                batch_size=1,
+                forced_token_ids=ForcedTokenIds.from_reqs(
+                    [_forced_req(prompt_len=2, forced=[30])], DEVICE
+                ),
+            )
+        )
+        positions = torch.tensor([3, 3, 3, 3, 1])
+        self.assertEqual(
+            info.forced_token_ids.lookup(positions, 1).tolist(), [10, N, N, N, 30]
+        )
+
+        info.filter_batch([1, 2, 4], torch.tensor([1, 2, 4]))
+        self.assertEqual(
+            info.forced_token_ids.lookup(torch.tensor([3, 3, 1]), 1).tolist(),
+            [N, N, 30],
+        )
+        info.filter_batch([0, 1], torch.tensor([0, 1]))
+        self.assertIsNone(info.forced_token_ids)
+
+    def test_force_probs_touches_only_forced_rows(self):
+        probs = torch.softmax(torch.randn(3, VOCAB_SIZE), dim=-1)
+        original = probs.clone()
+        force_probs_(probs, torch.tensor([5, NOT_FORCED, 0], dtype=torch.int32))
+        expected = original.clone()
+        expected[0] = torch.nn.functional.one_hot(torch.tensor(5), VOCAB_SIZE)
+        expected[2] = torch.nn.functional.one_hot(torch.tensor(0), VOCAB_SIZE)
+        torch.testing.assert_close(probs, expected)
 
 
 if __name__ == "__main__":

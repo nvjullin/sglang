@@ -24,6 +24,7 @@ from sglang.srt.layers.logprob_processor import (
     OutputLogprobProcessor,
 )
 from sglang.srt.runtime_context import get_exec, get_parallel, get_server_args
+from sglang.srt.sampling.forced_token_ids import force_tokens
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.utils.async_probe import maybe_detect_nan, sanitize_nan_logits
@@ -318,16 +319,12 @@ class Sampler(nn.Module):
                     )
                 del probs
 
-        # Forced-token-ids debug feature: replace the sampled token with the
-        # request's forced token (sentinel -1 = not forced). Runs before the
-        # logprob gather so the chosen-token logprob matches the emitted token;
-        # the top-k logprobs come from the unmodified distribution.
-        if sampling_info.forced_next_token_ids is not None:
-            forced = sampling_info.forced_next_token_ids
-            batch_next_token_ids = torch.where(
-                forced.ge(0),
-                forced.to(batch_next_token_ids.dtype),
+        # Forced-token-ids debug feature. Before the logprob gather, so the chosen
+        # logprob is the forced token's; top-k comes from the unmodified distribution.
+        if sampling_info.forced_token_ids is not None:
+            batch_next_token_ids = force_tokens(
                 batch_next_token_ids,
+                sampling_info.forced_token_ids.lookup(positions, rows_per_req=1),
             )
 
         if return_logprob:
@@ -362,7 +359,7 @@ class Sampler(nn.Module):
                 if (
                     SYNC_TOKEN_IDS_ACROSS_TP
                     or sampling_info.grammars
-                    or sampling_info.forced_next_token_ids is not None
+                    or sampling_info.forced_token_ids is not None
                 ):
                     # Token sync or forcing can replace the producer-selected token.
                     sampling_mask_capture = sampling_mask_capture._replace(

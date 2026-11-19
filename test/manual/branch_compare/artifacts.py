@@ -38,6 +38,8 @@ def read_meta(artifact_dir: str) -> Dict[str, Any]:
 def write_prompt_artifact(
     artifact_dir: str,
     idx: int,
+    *,
+    input_ids: List[int],
     output_ids: List[int],
     top_k_token_ids: List[List[int]],
     top_k_logprobs: List[List[float]],
@@ -46,6 +48,7 @@ def write_prompt_artifact(
     """Write a per-request torch artifact.
 
     Tensors:
+      input_ids:         int64 [P]      (the prompt; verify replays the record's)
       output_ids:        int64 [N]      (also the forced token ids on verify)
       top_k_token_ids:   int32 [N, K]
       top_k_logprobs:    bf16  [N, K]
@@ -58,6 +61,7 @@ def write_prompt_artifact(
         k = len(top_k_token_ids[0]) if top_k_token_ids else 0
 
     out = {
+        "input_ids": torch.tensor(input_ids, dtype=torch.int64),
         "output_ids": torch.tensor(output_ids, dtype=torch.int64),
         "top_k_token_ids": (
             torch.tensor(top_k_token_ids, dtype=torch.int32)

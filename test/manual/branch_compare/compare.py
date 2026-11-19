@@ -12,6 +12,9 @@ Steps with fewer than 2 common tokens have no value (NaN) and are left out.
 These per-step scalars are aggregated into mean/p50/p90/p99/min/max.
 The intersection size (`common_topk_count`) per step is also reported - if
 it dips below K, the rank ordering itself shifted.
+
+`verdict.json` holds pass/fail under VERDICT_POLICY: the hard checks always run;
+each threshold check runs only when its limit is given.
 """
 
 from __future__ import annotations
@@ -75,11 +78,124 @@ def _aggregate(values: List[float]) -> Dict[str, float]:
     }
 
 
+VERDICT_POLICY = "branch_compare.v1"
+
+
+def _check(name: str, ok: bool, value: Any, limit: Any = None) -> Dict[str, Any]:
+    return {"name": name, "pass": bool(ok), "value": value, "limit": limit}
+
+
+def _verdict(
+    args: argparse.Namespace,
+    record_meta: Dict[str, Any],
+    branch_meta: Dict[str, Any],
+    summary: Dict[str, Any],
+) -> Dict[str, Any]:
+    record_idx = {p["idx"] for p in record_meta["prompts"]}
+    branch_idx = {p["idx"] for p in branch_meta["prompts"]}
+    abs_diff = summary["mean_abs_diff"]
+    common = summary["common_topk_count"]
+    topk = summary["topk"] or 0
+    checks = [
+        # Forcing failed: the two sides saw different prefixes.
+        _check(
+            "forced_tokens_match",
+            not summary["failed_steps"],
+            len(summary["failed_steps"]),
+            0,
+        ),
+        # A failed request leaves its prompt unverified.
+        _check(
+            "all_prompts_verified",
+            record_idx <= branch_idx,
+            len(record_idx - branch_idx),
+            0,
+        ),
+        # No step shares two top-K tokens: a different model, not drift.
+        _check("measurable_steps", abs_diff["n"] > 0, abs_diff["n"]),
+    ]
+    finite = abs_diff["n"] > 0
+    if args.max_mean_abs_diff is not None:
+        checks.append(
+            _check(
+                "mean_abs_diff",
+                finite and abs_diff["mean"] <= args.max_mean_abs_diff,
+                abs_diff["mean"],
+                args.max_mean_abs_diff,
+            )
+        )
+    if args.max_p99_abs_diff is not None:
+        checks.append(
+            _check(
+                "p99_abs_diff",
+                finite and abs_diff["p99"] <= args.max_p99_abs_diff,
+                abs_diff["p99"],
+                args.max_p99_abs_diff,
+            )
+        )
+    chosen = summary["chosen_abs_diff"]
+    if args.max_chosen_abs_diff_mean is not None:
+        checks.append(
+            _check(
+                "chosen_abs_diff_mean",
+                chosen["n"] > 0 and chosen["mean"] <= args.max_chosen_abs_diff_mean,
+                chosen["mean"],
+                args.max_chosen_abs_diff_mean,
+            )
+        )
+    if args.min_common_topk_frac is not None:
+        frac = common["mean"] / topk if topk and common["n"] > 0 else float("nan")
+        checks.append(
+            _check(
+                "common_topk_frac",
+                frac >= args.min_common_topk_frac,
+                frac,
+                args.min_common_topk_frac,
+            )
+        )
+    return {
+        "policy": VERDICT_POLICY,
+        "pass": all(c["pass"] for c in checks),
+        "checks": checks,
+        "record_dir": os.path.abspath(args.record_dir),
+        "branch_dir": os.path.abspath(args.branch_dir),
+        "topk": topk,
+        "mean_abs_diff": abs_diff,
+        "common_topk_count": common,
+        "chosen_abs_diff": chosen,
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--record-dir", required=True)
     parser.add_argument("--branch-dir", required=True)
     parser.add_argument("--out-dir", required=True)
+    parser.add_argument(
+        "--max-mean-abs-diff",
+        type=float,
+        default=None,
+        help="Fail when the mean abs logprob diff (nats) exceeds this.",
+    )
+    parser.add_argument(
+        "--max-p99-abs-diff",
+        type=float,
+        default=None,
+        help="Fail when the p99 of the per-step abs diff exceeds this.",
+    )
+    parser.add_argument(
+        "--max-chosen-abs-diff-mean",
+        type=float,
+        default=None,
+        help="Fail when the mean |logprob diff| of the emitted token exceeds this. "
+        "Unlike the top-K mean, the low-probability tail does not dominate it.",
+    )
+    parser.add_argument(
+        "--min-common-topk-frac",
+        type=float,
+        default=None,
+        help="Fail when the mean common top-K count / K falls below this.",
+    )
     args = parser.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
@@ -90,6 +206,8 @@ def main() -> None:
 
     abs_all: List[float] = []
     common_all: List[float] = []
+    # |record - verify| logprob of the emitted (forced) token, per step.
+    chosen_all: List[float] = []
     per_prompt: List[Dict[str, Any]] = []
 
     for entry in branch_meta["prompts"]:
@@ -119,6 +237,13 @@ def main() -> None:
         main_top_ids = main_a["top_k_token_ids"].numpy()
         branch_top_ids = branch_a["top_k_token_ids"].numpy()
 
+        same = main_a["output_ids"][:n_steps] == branch_a["output_ids"][:n_steps]
+        chosen = (
+            main_a["chosen_logprob"][:n_steps].float()
+            - branch_a["chosen_logprob"][:n_steps].float()
+        ).abs()
+        chosen_all.extend(chosen[same].tolist())
+
         prompt_abs: List[float] = []
         for s in range(n_steps):
             mabs, common = _per_step_metrics(
@@ -147,7 +272,9 @@ def main() -> None:
         "topk": record_meta.get("topk_logprobs"),
         "mean_abs_diff": _aggregate(abs_all),
         "common_topk_count": _aggregate(common_all),
+        "chosen_abs_diff": _aggregate(chosen_all),
         "failed_steps": branch_meta.get("failed_steps", []),
+        "failed_requests": branch_meta.get("failed_requests", []),
         "per_prompt": per_prompt,
     }
 
@@ -155,6 +282,17 @@ def main() -> None:
     with open(summary_path, "w") as f:
         json.dump(summary, f, indent=2)
     print(f"[branch_compare] wrote {summary_path}")
+
+    verdict = _verdict(args, record_meta, branch_meta, summary)
+    verdict_path = os.path.join(args.out_dir, "verdict.json")
+    with open(verdict_path, "w") as f:
+        json.dump(verdict, f, indent=2)
+    failed = [c["name"] for c in verdict["checks"] if not c["pass"]]
+    print(
+        f"[branch_compare] verdict {'PASS' if verdict['pass'] else 'FAIL'}"
+        + (f" ({', '.join(failed)})" if failed else "")
+        + f"; wrote {verdict_path}"
+    )
 
     # Terminal histograms (also archived to histograms.txt). The panels
     # share the same width / bin count for easy visual comparison.

@@ -158,6 +158,7 @@ def _round(bs, generator, vocab=VOCAB):
             logit_bias=None,
             sampling_seed=None,
             has_watermark_candidates=False,
+            forced_token_ids=None,
             temperatures=None,
             top_ks=None,
             top_ps=None,
@@ -324,6 +325,7 @@ class TestPostVerifyGraphs(CustomTestCase):
                 sampling_seed=None,
                 need_min_p_sampling=False,
                 has_watermark_candidates=False,
+                forced_token_ids=None,
                 is_all_greedy=False,
                 need_top_k_sampling=True,
                 need_top_p_sampling=True,
@@ -358,6 +360,8 @@ class TestPostVerifyGraphs(CustomTestCase):
             dict(logit_bias=torch.zeros(1)),
             dict(sampling_seed=torch.zeros(1)),
             dict(need_min_p_sampling=True),
+            # the graphs have no input for forced ids, so a replay would not force them
+            dict(forced_token_ids=object()),
         ):
             with self.subTest(change=sorted(change)):
                 self.assertIsNone(key(**change))
@@ -458,6 +462,7 @@ class TestPostVerifyGraphs(CustomTestCase):
                 sampling_seed=None,
                 need_min_p_sampling=False,
                 has_watermark_candidates=False,
+                forced_token_ids=None,
                 is_all_greedy=False,
                 need_top_k_sampling=True,
                 need_top_p_sampling=False,

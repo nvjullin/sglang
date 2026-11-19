@@ -239,6 +239,7 @@ def make_post_verify_io(
             **watermark_view_fields(sampling_info.watermark),
             max_top_k=sampling_info.max_top_k,
             device=torch.device(device),
+            forced_token_ids=sampling_info.forced_token_ids,
         ),
         grammar_mask=grammar_mask,
         watermark=watermark,

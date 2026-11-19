@@ -25,6 +25,7 @@ import os
 from typing import Any, Dict, List, Tuple
 
 import numpy as np
+import torch
 from branch_compare import artifacts
 
 
@@ -81,6 +82,27 @@ def _aggregate(values: List[float]) -> Dict[str, float]:
 VERDICT_POLICY = "branch_compare.v1"
 
 
+def _token_mismatch(
+    record: Dict[str, torch.Tensor], branch: Dict[str, torch.Tensor]
+) -> str | None:
+    """Why the two artifacts did not see the same tokens, or None. Their logprobs
+    are comparable only when the prompt and every emitted token match."""
+    if not torch.equal(record["input_ids"], branch["input_ids"]):
+        return "input_ids differ"
+    if not torch.equal(record["output_ids"], branch["output_ids"]):
+        return "output_ids differ"
+    for side, a in (("record", record), ("branch", branch)):
+        n = a["output_ids"].numel()
+        rows = (
+            a["top_k_token_ids"].shape[0],
+            a["top_k_logprobs"].shape[0],
+            a["chosen_logprob"].numel(),
+        )
+        if any(r != n for r in rows):
+            return f"{side} logprob rows {rows} != {n} output tokens"
+    return None
+
+
 def _check(name: str, ok: bool, value: Any, limit: Any = None) -> Dict[str, Any]:
     return {"name": name, "pass": bool(ok), "value": value, "limit": limit}
 
@@ -96,14 +118,19 @@ def _verdict(
     abs_diff = summary["mean_abs_diff"]
     common = summary["common_topk_count"]
     topk = summary["topk"] or 0
+    mismatched = {m["idx"] for m in summary["token_mismatches"]} | {
+        m["prompt_idx"] for m in summary["failed_steps"]
+    }
     checks = [
-        # Forcing failed: the two sides saw different prefixes.
+        # A verify of a record, not a second record (whose sampled tokens may match).
         _check(
-            "forced_tokens_match",
-            not summary["failed_steps"],
-            len(summary["failed_steps"]),
-            0,
+            "branch_is_verify",
+            branch_meta.get("phase") == "verify",
+            branch_meta.get("phase"),
+            "verify",
         ),
+        # Forcing failed: the two sides saw different prefixes.
+        _check("forced_tokens_match", not mismatched, len(mismatched), 0),
         # A failed request leaves its prompt unverified.
         _check(
             "all_prompts_verified",
@@ -209,6 +236,7 @@ def main() -> None:
     # |record - verify| logprob of the emitted (forced) token, per step.
     chosen_all: List[float] = []
     per_prompt: List[Dict[str, Any]] = []
+    token_mismatches: List[Dict[str, Any]] = []
 
     for entry in branch_meta["prompts"]:
         idx = entry["idx"]
@@ -220,27 +248,35 @@ def main() -> None:
         main_a = artifacts.read_prompt_artifact(args.record_dir, idx)
         branch_a = artifacts.read_prompt_artifact(args.branch_dir, idx)
 
-        # Steps must match (verify is forced to record's length). Compare
-        # the shorter prefix if not (e.g. forcing-mismatch case).
+        reason = _token_mismatch(main_a, branch_a)
+        if reason is not None:
+            print(f"[branch_compare] idx={idx}: {reason}")
+            token_mismatches.append({"idx": idx, "reason": reason})
+
+        # On a mismatch, the metrics below still cover the common prefix of rows.
         n_steps = min(
             main_a["top_k_token_ids"].shape[0],
             branch_a["top_k_token_ids"].shape[0],
         )
 
-        # Convert bf16 -> float32 for numpy.
-        main_top_lps_f32 = (
-            main_a["top_k_logprobs"].to(dtype=__import__("torch").float32).numpy()
-        )
-        branch_top_lps_f32 = (
-            branch_a["top_k_logprobs"].to(dtype=__import__("torch").float32).numpy()
-        )
+        # float32 for numpy (artifacts written before float32 storage are bf16).
+        main_top_lps_f32 = main_a["top_k_logprobs"].float().numpy()
+        branch_top_lps_f32 = branch_a["top_k_logprobs"].float().numpy()
         main_top_ids = main_a["top_k_token_ids"].numpy()
         branch_top_ids = branch_a["top_k_token_ids"].numpy()
 
-        same = main_a["output_ids"][:n_steps] == branch_a["output_ids"][:n_steps]
+        n_ids = min(
+            n_steps,
+            *(
+                a[k].numel()
+                for a in (main_a, branch_a)
+                for k in ("output_ids", "chosen_logprob")
+            ),
+        )
+        same = main_a["output_ids"][:n_ids] == branch_a["output_ids"][:n_ids]
         chosen = (
-            main_a["chosen_logprob"][:n_steps].float()
-            - branch_a["chosen_logprob"][:n_steps].float()
+            main_a["chosen_logprob"][:n_ids].float()
+            - branch_a["chosen_logprob"][:n_ids].float()
         ).abs()
         chosen_all.extend(chosen[same].tolist())
 
@@ -273,6 +309,7 @@ def main() -> None:
         "mean_abs_diff": _aggregate(abs_all),
         "common_topk_count": _aggregate(common_all),
         "chosen_abs_diff": _aggregate(chosen_all),
+        "token_mismatches": token_mismatches,
         "failed_steps": branch_meta.get("failed_steps", []),
         "failed_requests": branch_meta.get("failed_requests", []),
         "per_prompt": per_prompt,

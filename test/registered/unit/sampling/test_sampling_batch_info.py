@@ -21,6 +21,7 @@ from sglang.srt.sampling.forced_token_ids import (
     NOT_FORCED,
     ForcedTokenIds,
     force_probs_,
+    force_tokens,
 )
 from sglang.srt.sampling.grammar_mask import build_grammar_mask
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
@@ -588,6 +589,18 @@ class TestForcedTokenIds(CustomTestCase):
             [N, N, 30],
         )
         self.assertIsNone(table.filter([0, 1]))
+
+    def test_force_tokens_on_per_request_verify_rows(self):
+        """Compact EAGLE sampling returns verify tokens as [bs, draft_token_num] while
+        the lookup is flat; forcing must line them up instead of raising or
+        broadcasting."""
+        N = NOT_FORCED
+        tokens = torch.tensor([[1, 2, 3], [4, 5, 6]])
+        forced = torch.tensor([7, N, N, N, 8, N], dtype=torch.int32)
+        self.assertEqual(force_tokens(tokens, forced).tolist(), [[7, 2, 3], [4, 8, 6]])
+        self.assertEqual(
+            force_tokens(torch.tensor([[1], [2]]), forced[:2]).tolist(), [[7], [2]]
+        )
 
     def test_force_probs_touches_only_forced_rows(self):
         probs = torch.softmax(torch.randn(3, VOCAB_SIZE), dim=-1)

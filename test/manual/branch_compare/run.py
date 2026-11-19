@@ -150,7 +150,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--topk-logprobs",
         type=int,
         default=None,
-        help="K for top_logprobs_num (default 128). PD disaggregation rejects K > 128.",
+        help="K for top_logprobs_num (default 128). PD disaggregation rejects K above "
+        "the servers' --disaggregation-max-top-logprobs-num (default 128).",
     )
 
     g.add_argument(
@@ -226,16 +227,21 @@ def _server_args_passthrough(args: argparse.Namespace) -> List[str]:
                 out.append(cli)
             # bool flags rarely have a paired --no-X; leave it alone otherwise
         elif isinstance(cur, list):
-            for item in cur:
-                out += [cli, str(item)]
+            # nargs="+" keeps only the last occurrence; only append actions repeat.
+            if isinstance(action, argparse._AppendAction):
+                for item in cur:
+                    out += [cli, str(item)]
+            else:
+                out += [cli, *map(str, cur)]
         else:
             out += [cli, str(cur)]
     return out
 
 
 def _project_artifact_size_gb(n_prompts: int, max_new_tokens: int, topk: int) -> float:
-    # bf16 logprobs (2B) + int32 token_ids (4B) per (step, k), plus int64 chosen_logprob (negligible)
-    bytes_per = (2 + 4) * topk
+    # float32 logprobs (4B) + int32 token_ids (4B) per (step, k); per-step ids and
+    # the chosen logprob are negligible.
+    bytes_per = (4 + 4) * topk
     total = n_prompts * max_new_tokens * bytes_per
     return total / (1024**3)
 

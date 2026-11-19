@@ -10,12 +10,15 @@ from types import SimpleNamespace
 
 import torch
 
+from sglang.srt.environ import envs
+from sglang.srt.kernel_plugins.nvidia.speculative_runtime import default_post_verify
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import get_parallel, publish, reset_context
 from sglang.srt.sampling.forced_token_ids import ForcedTokenIds
 from sglang.srt.sampling.sampling_params import FORCED_TOKEN_IDS_KEY
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.eagle_utils import eagle_sample
+from sglang.srt.speculative.eagle_worker_common import make_post_verify_io
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -76,6 +79,7 @@ def _verify_round(*, greedy, generator):
         retrieve_index=torch.arange(BATCH * TOKENS, device=device).view(BATCH, TOKENS),
         retrieve_next_token=next_token.expand(BATCH, TOKENS).contiguous().to(device),
         retrieve_next_sibling=torch.full((BATCH, TOKENS), -1, device=device),
+        custom_mask=None,
     )
     sampling_info = SimpleNamespace(
         is_all_greedy=greedy,
@@ -90,6 +94,11 @@ def _verify_round(*, greedy, generator):
         temperatures=torch.ones((BATCH, 1), device=device),
         top_ks=None,
         top_ps=None,
+        min_ps=None,
+        watermark_keys=None,
+        watermark_context_windows=None,
+        watermark_enabled=None,
+        max_top_k=None,
     )
     batch = SimpleNamespace(
         device=device,
@@ -115,19 +124,37 @@ class TestEagleForcedTokens(CustomTestCase):
             get_parallel().override(tp_group=SimpleNamespace(world_size=1))
         )
 
-    def _check(self, greedy):
+    def _check(self, greedy, *, provider_view=False):
         generator = torch.Generator().manual_seed(0)
         for _ in range(8):
             batch, verify_input, logits, forced, generated, keep = _verify_round(
                 greedy=greedy, generator=generator
             )
-            predict, accept_lens, accept_index = eagle_sample(
-                verify_input,
-                batch,
-                SimpleNamespace(
-                    next_token_logits=logits, next_token_logits_vocab_shard=None
-                ),
+            logits_output = SimpleNamespace(
+                next_token_logits=logits, next_token_logits_vocab_shard=None
             )
+            if provider_view:
+                io = make_post_verify_io(
+                    verify_input=verify_input,
+                    sampling_info=batch.sampling_info,
+                    sequence_lengths=batch.seq_lens,
+                    request_pool_indices=batch.req_pool_indices,
+                    device=batch.device,
+                    logits_output=logits_output,
+                    grammar_mask=None,
+                    watermark=None,
+                    watermark_full_mask=True,
+                    return_logprob=False,
+                    is_idle=False,
+                )
+                out = default_post_verify(io, None)
+                predict = out.token_ids
+                accept_lens = out.accepted_lengths
+                accept_index = out.accepted_indices
+            else:
+                predict, accept_lens, accept_index = eagle_sample(
+                    verify_input, batch, logits_output
+                )
             accept_lens = accept_lens.cpu()
             emitted = predict[accept_index.clamp(min=0)].cpu()
             for i, ids in forced.items():
@@ -140,10 +167,22 @@ class TestEagleForcedTokens(CustomTestCase):
                 )
 
     def test_greedy_verify_emits_the_forced_tokens(self):
-        self._check(greedy=True)
+        # The runtime optimization fuses the greedy chain tail (_chain_accept).
+        for fused in (False, True):
+            with self.subTest(fused_chain_accept=fused):
+                with envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(fused):
+                    self._check(greedy=True)
 
     def test_sampled_verify_emits_the_forced_tokens(self):
         self._check(greedy=False)
+
+    def test_provider_verify_view_carries_the_forced_tokens(self):
+        """The worker verifies through the provider's frozen sampling view, not
+        SamplingBatchInfo; the view must carry the forced ids to eagle_sample."""
+        for greedy, fused in ((True, False), (True, True), (False, False)):
+            with self.subTest(greedy=greedy, fused_chain_accept=fused):
+                with envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(fused):
+                    self._check(greedy=greedy, provider_view=True)
 
 
 if __name__ == "__main__":

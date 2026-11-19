@@ -18,6 +18,8 @@ import msgspec
 from sglang.srt.entrypoints.openai.protocol import OPENAI_MAX_N
 from sglang.srt.environ import envs
 from sglang.srt.sampling.sampling_params import (
+    FORCED_TOKEN_IDS_KEY,
+    FORCED_TOKEN_IDS_PATH_KEY,
     LOGIT_BIAS_ABS_MAX,
     MAX_LEN,
     MAX_REQUEST_REASONING_END_TOKEN_IDS,
@@ -428,6 +430,24 @@ class TestSamplingParamsVerify(CustomTestCase):
         for grammar, value in self.GRAMMAR_VALUES.items():
             with self.subTest(grammar=grammar):
                 self._make(**{grammar: value}).verify(self.VOCAB_SIZE)
+
+    def test_forced_token_ids_reject_beam_search(self):
+        """Beam search picks tokens outside the sampler, so a forced request with
+        beam_width > 1 would run unforced; it must be refused instead."""
+        transports = {
+            "inline": {FORCED_TOKEN_IDS_KEY: [1, 2]},
+            "path": {FORCED_TOKEN_IDS_PATH_KEY: "/forced.pt"},
+        }
+        with envs.SGLANG_ENABLE_FORCED_TOKEN_IDS.override(True):
+            for name, custom_params in transports.items():
+                with self.subTest(transport=name):
+                    with self.assertRaisesRegex(ValueError, "beam_width"):
+                        self._make(custom_params=custom_params, beam_width=2).verify(
+                            self.VOCAB_SIZE
+                        )
+                    self._make(custom_params=custom_params, beam_width=1).verify(
+                        self.VOCAB_SIZE
+                    )
 
 
 class TestSamplingParamsNormalize(CustomTestCase):

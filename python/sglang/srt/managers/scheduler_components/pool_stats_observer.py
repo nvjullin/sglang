@@ -243,6 +243,8 @@ class SchedulerPoolStatsObserver:
         return sum(kv_mamba_slots(kv) for kv in self._session_kv_rows())
 
     def get_pool_stats(self) -> PoolStats:
+        if self.tree_cache.lends_kv:
+            return self.tree_cache.pool_stats()
         usage = self.storage.usage()
         (full,) = (u for u in usage if u.metrics == "full")
         mamba = next((u for u in usage if u.metrics == "mamba"), None)

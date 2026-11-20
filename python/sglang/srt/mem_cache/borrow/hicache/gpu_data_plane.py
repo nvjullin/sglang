@@ -106,6 +106,14 @@ class GpuDataPlane(DataPlane):
         self._layer_count = kv_pool.layer_num
         self._queued: list[tuple[list[int], list[int], _GpuOp]] = []
 
+    def _slots(self, pages: Sequence[int], *, on_device: bool) -> torch.Tensor:
+        ps = self.page_size
+        page_t = torch.tensor(list(pages), dtype=torch.int64)
+        slots = (page_t[:, None] * ps + torch.arange(ps)).flatten()
+        if not on_device:
+            return slots
+        return slots.pin_memory().to(self.device, non_blocking=True)
+
     def _transfers(
         self, host_pages: Sequence[int], device_pages: Sequence[int], *, write: bool
     ) -> list[L2Transfer]:
@@ -174,11 +182,13 @@ class GpuDataPlane(DataPlane):
         with torch.cuda.stream(self.side_stream):
             if after is not None:
                 self.side_stream.wait_event(after)
+            # Index copies go first: the transfer waits only on the start event.
+            transfers = self._transfers(host_pages, device_pages, write=False)
             index = self.counter.update_producer()
             layer_events = self.counter.events[index]
             layer_events.start_event.record()
             self.engine.submit_host_to_device(
-                self._transfers(host_pages, device_pages, write=False),
+                transfers,
                 start_event=layer_events.start_event,
                 on_layer_done=layer_events.complete,
                 transfer_layer_id_max=self._layer_count,

@@ -16,13 +16,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from fake_runtime import FakeDataPlane, FakeReq, FakeRuntime, kv_content
 
-from sglang.srt.mem_cache.borrow.api import (
-    AcquireReq,
-    AcquireStatus,
-    CacheKey,
-    LeaseAttrs,
-    Revoked,
-)
+from sglang.srt.mem_cache.borrow.api import AcquireReq, CacheKey, LeaseAttrs
 from sglang.srt.mem_cache.borrow.hicache.page_allocator import PageAllocator
 from sglang.srt.mem_cache.borrow.hicache.service import HiCacheService, ServiceConfig
 from sglang.srt.mem_cache.borrow.threaded import CacheServiceError, ThreadedService

@@ -123,6 +123,22 @@ class BorrowTreeFacade(BasePrefixCache):
     def release_host_resources(self) -> None:
         self.client.close()
 
+    def pool_stats(self):
+        """Device KV usage as the cache service reports it."""
+        from sglang.srt.managers.scheduler_components.pool_stats_observer import (
+            PoolStats,
+        )
+
+        st = self.client.service.stats()
+        used = st.device_slots - st.device_free_slots - st.device_evictable_slots
+        return PoolStats(
+            full_num_used=used,
+            full_token_usage=used / st.device_slots,
+            full_available_size=st.device_free_slots,
+            full_evictable_size=st.device_evictable_slots,
+            full_capacity=st.device_slots,
+        )
+
     def available_and_evictable_str(self) -> str:
         st = self.client.service.stats()
         return (

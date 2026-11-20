@@ -2691,6 +2691,10 @@ class Scheduler(
         return False
 
     def get_prefill_adder_class(self) -> type[PrefillAdder]:
+        if self.tree_cache.lends_kv:
+            from sglang.srt.managers.borrow_cache.adder import BorrowPrefillAdder
+
+            return BorrowPrefillAdder
         return UocrPrefillAdder if self.uocr_runtime is not None else PrefillAdder
 
     def get_rust_server_class(self) -> type[RustServer]:
@@ -5179,6 +5183,9 @@ class Scheduler(
             batch.batch_is_full = False
             return batch
 
+        if self.tree_cache.lends_kv:
+            return self._update_running_batch_lending_kv(batch, initial_bs)
+
         if self.uocr_runtime is not None:
             # Retained document windows yield to running requests before retraction.
             self.uocr_runtime.free_for_decode(batch)
@@ -5258,6 +5265,21 @@ class Scheduler(
 
         # Update batch tensors
         batch.prepare_for_decode()
+        return batch
+
+    def _update_running_batch_lending_kv(
+        self, batch: ScheduleBatch, initial_bs: int
+    ) -> ScheduleBatch:
+        """update_running_batch when a cache service lends the KV: it decides
+        which requests to retract."""
+        from sglang.srt.managers.borrow_cache.scheduling import grow_decode_or_retract
+
+        for req in grow_decode_or_retract(batch, request_retirer=self.request_retirer):
+            self._add_request_to_queue(req, is_retracted=True)
+        if batch.batch_size() < initial_bs:
+            batch.batch_is_full = False
+        if not batch.is_empty():
+            batch.prepare_for_decode()
         return batch
 
     def record_batch_in_overlap(self, batch: ScheduleBatch):
@@ -5369,6 +5391,25 @@ class Scheduler(
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
         """Run a batch."""
+        if not self.tree_cache.lends_kv:
+            return self._run_batch(batch, pp_proxy_tensors)
+        from sglang.srt.managers.borrow_cache import scheduling as kv_lending
+
+        stream = (
+            self.forward_stream
+            if self.enable_overlap
+            else self.device_module.current_stream()
+        )
+        kv_lending.begin_forward(self.tree_cache.client, batch, stream=stream)
+        ret = self._run_batch(batch, pp_proxy_tensors)
+        kv_lending.end_forward(self.tree_cache.client, stream=stream)
+        return ret
+
+    def _run_batch(
+        self,
+        batch: ScheduleBatch,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+    ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
         launch = self._on_step_launch(batch)
 
         if self.forward_sleep_time is not None:
@@ -6179,8 +6220,9 @@ class Scheduler(
                 idle &= len(self.decode_offload_manager.ongoing_offload) == 0
 
             # HiCache: in-flight async ops (GPU↔Host↔L3) must drain before
-            # destructive operations like attach/detach/flush_cache.
-            if self.enable_hierarchical_cache:
+            # destructive operations like attach/detach/flush_cache. A cache
+            # service drains its own copies.
+            if self.enable_hierarchical_cache and not self.tree_cache.lends_kv:
                 tc = self.tree_cache
                 idle &= len(tc.ongoing_write_through) == 0
                 idle &= len(tc.ongoing_load_back) == 0

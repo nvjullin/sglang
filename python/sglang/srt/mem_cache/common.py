@@ -238,6 +238,10 @@ def checkpoint_kv_cache(req: Req, tree_cache: BasePrefixCache) -> None:
     # The tree reads req.finished() to tell a checkpoint from the final
     # insert; a finished request belongs in release_kv_cache.
     assert not req.finished(), f"checkpointing finished request {req.rid}"
+    if tree_cache.lends_kv:
+        from sglang.srt.managers.borrow_cache import kv_ops
+
+        return kv_ops.checkpoint_kv_cache(req, tree_cache)
     if not req.skip_radix_cache_insert:
         tree_cache.checkpoint(req, up_to=req.extend_end)
     # The next extend resumes after this one, published or not.
@@ -385,6 +389,10 @@ def discard_kv_cache_backup(req: Req, tree_cache: BasePrefixCache) -> None:
 def release_kv_cache(req: Req, tree_cache: BasePrefixCache, *, checkpoint: bool):
     """Give the request's kv row back; with ``checkpoint`` the tree first keeps
     what it can key."""
+    if tree_cache.lends_kv:
+        from sglang.srt.managers.borrow_cache import kv_ops
+
+        return kv_ops.release_kv_cache(req, tree_cache, checkpoint=checkpoint)
     assert (not req.kv.holds_kv) == req.kv.is_kv_released
     # A mamba-capable cache may alloc mamba state before alloc KV cache
     if not req.kv.holds_kv:

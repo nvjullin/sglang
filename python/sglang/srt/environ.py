@@ -915,6 +915,10 @@ class Envs:
     # ===================================================================
     # HiCache storage backends and mmap allocation
     # ===================================================================
+    # Run the prefix cache (device + host tiers) as a service on its own thread
+    # that the scheduler reaches only through the borrow API
+    # (sglang.srt.mem_cache.borrow.api); experimental, default paths only.
+    SGLANG_ENABLE_DECOUPLED_HICACHE = EnvBool(False)
     # Per-call cudaHostRegister limit in GB.
     SGLANG_HICACHE_HOST_REGISTER_CHUNK_GB = EnvInt(256)
     # Base token count for each MLA/DSA dedup broadcast chunk.

@@ -488,6 +488,9 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     storage_prefetch_retries: Optional[StoragePrefetchRetries] = None
     # Set by caches that publish KV placement events; None means they don't.
     kv_events: Optional[KVCacheEventRecorder] = None
+    # True when a cache service lends the KV slots (SGLANG_ENABLE_DECOUPLED_HICACHE):
+    # rows and slots then move only through sglang.srt.managers.borrow_cache.
+    lends_kv: bool = False
 
     def init_metrics_collector(self):
         from sglang.srt.layers.dp_attention import is_dp_attention_enabled

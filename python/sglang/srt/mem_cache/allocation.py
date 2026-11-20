@@ -370,6 +370,10 @@ def alloc_for_extend(
     (the last is the host/CPU mirror). ``alloc_req_slots`` raises ``RuntimeError``
     if the pool can't satisfy the batch (fail-loud — see its docstring).
     """
+    if batch.tree_cache.lends_kv:
+        from sglang.srt.managers.borrow_cache import kv_ops
+
+        return kv_ops.alloc_for_extend(batch)
     # free out-of-window swa tokens
     batch.maybe_evict_swa()
 
@@ -800,6 +804,10 @@ ALLOC_FOR_DECODE_FUNCS = defaultdict(lambda: alloc_for_decode_default)
 
 
 def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
+    if batch.tree_cache.lends_kv:
+        from sglang.srt.managers.borrow_cache import kv_ops
+
+        return kv_ops.alloc_for_decode(batch, token_per_req)
     return ALLOC_FOR_DECODE_FUNCS[_device_type(batch)](batch, token_per_req)
 
 
@@ -863,6 +871,21 @@ def alloc_for_spec_decode(
     num_needed_tokens: int,
     batch: Optional[ScheduleBatch] = None,
 ) -> None:
+    if tree_cache.lends_kv:
+        from sglang.srt.managers.borrow_cache import kv_ops
+
+        return kv_ops.alloc_for_spec_decode(
+            tree_cache,
+            req_to_token_pool,
+            reqs=reqs,
+            req_pool_indices=req_pool_indices,
+            cur_kv_lens=cur_kv_lens,
+            cur_kv_lens_cpu=cur_kv_lens_cpu,
+            nxt_kv_lens=nxt_kv_lens,
+            nxt_kv_lens_cpu=nxt_kv_lens_cpu,
+            num_needed_tokens=num_needed_tokens,
+            batch=batch,
+        )
     if num_needed_tokens > 0:
         if tree_cache.token_to_kv_pool_allocator.page_size == 1:
             out_cache_loc = alloc_token_slots(tree_cache, num_needed_tokens)

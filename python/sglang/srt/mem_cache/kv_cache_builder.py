@@ -502,6 +502,32 @@ def build_kv_cache(
             sliding_window_size,
         )
 
+    if envs.SGLANG_ENABLE_DECOUPLED_HICACHE.get():
+        from sglang.srt.managers.borrow_cache.build import build_borrow_tree_facade
+
+        tree_cache = build_borrow_tree_facade(
+            tp_worker=tp_worker,
+            model_config=model_config,
+            req_to_token_pool=req_to_token_pool,
+            token_to_kv_pool_allocator=token_to_kv_pool_allocator,
+            page_size=params.page_size,
+            enable_hierarchical_cache=enable_hierarchical_cache,
+            spec_algorithm=spec_algorithm,
+            draft_plan=hicache_draft_plan,
+        )
+        init_mm_embedding_cache(envs.SGLANG_VLM_CACHE_SIZE_MB.get() * 1024 * 1024)
+        return KVCacheBuildResult(
+            is_hybrid_swa=is_hybrid_swa,
+            is_hybrid_ssm=is_hybrid_ssm,
+            sliding_window_size=sliding_window_size,
+            full_tokens_per_layer=full_tokens_per_layer,
+            swa_tokens_per_layer=swa_tokens_per_layer,
+            req_to_token_pool=req_to_token_pool,
+            token_to_kv_pool_allocator=token_to_kv_pool_allocator,
+            disable_radix_cache=disable_radix_cache,
+            tree_cache=tree_cache,
+        )
+
     tree_context = TreeCacheBuildContext(
         server_args=server_args,
         params=params,

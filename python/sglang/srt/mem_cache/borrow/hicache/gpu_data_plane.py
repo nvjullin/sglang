@@ -80,7 +80,10 @@ def _packed_draft_layer(layer_id: int, *, expected: int, host_layer: int) -> Opt
 
 class GpuDataPlane(DataPlane):
     """Copies for every host mirror at once; all mirrors share page ids. The
-    first mirror is the target KV pool, whose layer count paces loads."""
+    first mirror is the target KV pool. Loads walk transfer layer ids
+    ``[0, transfer_layer_id_max)`` (default: the target pool's layer count);
+    each mirror's ``layer_mapper`` picks the ids it holds (a hybrid model's
+    attention layers are a subset)."""
 
     def __init__(
         self,
@@ -89,6 +92,7 @@ class GpuDataPlane(DataPlane):
         page_size: int,
         io_backend: str,
         device: torch.device,
+        transfer_layer_id_max: Optional[int] = None,
     ):
         self.page_size = page_size
         self.io_backend = io_backend
@@ -102,7 +106,11 @@ class GpuDataPlane(DataPlane):
         self._host = PageAllocator(num_pages=self.host_num_pages)
         self.engine = L2TransferEngine(io_backend)
         self.side_stream = torch.cuda.Stream(device=device)
-        self._layer_count = self._mirrors[0].device_pool.layer_num
+        self._layer_count = (
+            self._mirrors[0].device_pool.layer_num
+            if transfer_layer_id_max is None
+            else transfer_layer_id_max
+        )
         self.counter = ServiceLayerCounter(self._layer_count)
         self._queued: list[tuple[list[int], list[int], _GpuOp]] = []
 

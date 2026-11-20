@@ -9,7 +9,7 @@ the borrow path instead.
 from __future__ import annotations
 
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable
 
 from sglang.srt.managers.borrow_cache.client import BorrowCacheClient
 from sglang.srt.mem_cache.borrow.api import CacheKey
@@ -45,8 +45,12 @@ class BorrowTreeFacade(BasePrefixCache):
         req_to_token_pool: Any,
         token_to_kv_pool_allocator: Any,
         page_size: int,
+        bind_pool_tables: Callable[[], None],
     ):
         self.client = client
+        # Re-applies the scheduler-side table setup the service relies on
+        # (see build.py); the scheduler's pool clear undoes it.
+        self.bind_pool_tables = bind_pool_tables
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.page_size = page_size

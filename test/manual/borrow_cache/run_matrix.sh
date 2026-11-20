@@ -1,7 +1,8 @@
 #!/bin/bash
 # Run two run_pair.sh comparisons side by side on a 4-GPU node.
 #   run_matrix.sh <src-root> <log-root> <case-a> <case-b>
-# A case name selects compare/server args from the table below.
+# A case name selects compare/server args from the table below; "<case>@aa"
+# runs both servers with the flag off.
 set -uo pipefail
 SRC=$1; ROOT=$2; shift 2
 MODEL=${MODEL:-Qwen/Qwen3-0.6B}
@@ -23,6 +24,12 @@ case_args() {
     eagle3)  echo "--num-prefixes 8 --prefix-len 1500 --rounds 3 --max-new-tokens 64 -- --model-path Qwen/Qwen3-8B --speculative-algorithm EAGLE3 --speculative-draft-model-path ${EAGLE_DRAFT:?set EAGLE_DRAFT} --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 $HI $DET --max-total-tokens 12288 --page-size 16" ;;
     mla)     echo "--num-prefixes 8 --prefix-len 1500 --rounds 3 --max-new-tokens 64 -- --model-path ${MLA_MODEL:?set MLA_MODEL} --trust-remote-code $HI $DET --max-total-tokens 8192 --page-size 16" ;;
     dsa)     echo "--num-prefixes 6 --prefix-len 3000 --rounds 3 --max-new-tokens 32 --prompts-per-round 24 -- --model-path ${DSA_MODEL:?set DSA_MODEL} --trust-remote-code --load-format dummy --json-model-override-args {\"num_hidden_layers\":4,\"first_k_dense_replace\":1,\"n_routed_experts\":32,\"num_nextn_predict_layers\":0} $HI --max-total-tokens 16384 --page-size 64" ;;
+    gdn)     echo "--num-prefixes 6 --prefix-len 3000 --rounds 3 --max-new-tokens 64 -- --model-path ${GDN_MODEL:?set GDN_MODEL} $HI $DET --max-total-tokens 16384 --page-size 64 --chunked-prefill-size 2048 --mamba-radix-cache-strategy extra_buffer --max-mamba-cache-size 48" ;;
+    kda)     echo "--num-prefixes 6 --prefix-len 3000 --rounds 3 --max-new-tokens 64 -- --model-path ${KDA_MODEL:?set KDA_MODEL} --trust-remote-code $HI $DET --max-total-tokens 16384 --page-size 64 --chunked-prefill-size 2048 --mamba-radix-cache-strategy extra_buffer --max-mamba-cache-size 48" ;;
+    gdn_seq) echo "--num-prefixes 6 --prefix-len 3000 --rounds 2 --prompts-per-round 24 --max-new-tokens 64 --concurrency 1 -- --model-path ${GDN_MODEL:?set GDN_MODEL} $HI $DET --max-total-tokens 131072 --page-size 64 --chunked-prefill-size 2048 --mamba-radix-cache-strategy extra_buffer --max-mamba-cache-size 48" ;;
+    kda_seq) echo "--num-prefixes 6 --prefix-len 3000 --rounds 2 --prompts-per-round 24 --max-new-tokens 64 --concurrency 1 -- --model-path ${KDA_MODEL:?set KDA_MODEL} --trust-remote-code $HI $DET --max-total-tokens 131072 --page-size 64 --chunked-prefill-size 2048 --mamba-radix-cache-strategy extra_buffer --max-mamba-cache-size 48" ;;
+    swa)     echo "--num-prefixes 6 --prefix-len 1500 --rounds 3 --max-new-tokens 64 -- --model-path ${SWA_MODEL:?set SWA_MODEL} $HI $DET --max-total-tokens 8192 --page-size 16 --chunked-prefill-size 1024" ;;
+    swa_seq) echo "--num-prefixes 6 --prefix-len 1500 --rounds 2 --prompts-per-round 24 --max-new-tokens 64 --concurrency 1 -- --model-path ${SWA_MODEL:?set SWA_MODEL} $HI $DET --max-total-tokens 8192 --page-size 16 --chunked-prefill-size 1024" ;;
     tp2dp2)  echo "--num-prefixes 8 --prefix-len 1500 --rounds 3 --max-new-tokens 64 -- --model-path $MODEL $HI $DET --max-total-tokens 8192 --page-size 16 --tp 2 --attn-dp-size 2" ;;
     tp2)     echo "--num-prefixes 8 --prefix-len 1500 --rounds 3 --max-new-tokens 128 -- --model-path $MODEL $HI $DET --max-total-tokens 8192 --page-size 16 --chunked-prefill-size 2048 --tp 2" ;;
     *) echo "unknown case $1" >&2; exit 2 ;;
@@ -30,10 +37,12 @@ case_args() {
 }
 
 run_case() {  # name gpu_a gpu_b port_a port_b
-  local name=$1
+  # A "<case>@aa" name runs the flag-off server twice: the noise floor of <case>.
+  local name=$1 flag_b=1
   local args
-  args=$(case_args "$name")
-  GPU_A=$2 GPU_B=$3 PORT_A=$4 PORT_B=$5 \
+  if [[ $name == *@aa ]]; then flag_b=0; fi
+  args=$(case_args "${name%@aa}")
+  FLAG_B=$flag_b GPU_A=$2 GPU_B=$3 PORT_A=$4 PORT_B=$5 \
     bash "$SRC/test/manual/borrow_cache/run_pair.sh" "$SRC" "$ROOT/$name" $args \
     > "$ROOT/$name.out" 2>&1
   echo "$name rc=$?"

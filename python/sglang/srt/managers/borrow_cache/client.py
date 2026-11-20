@@ -22,6 +22,8 @@ from sglang.srt.mem_cache.borrow.api import (
     KVCacheService,
     LeaseAttrs,
     Revoked,
+    StateAnchor,
+    StateGrant,
 )
 
 if TYPE_CHECKING:
@@ -33,14 +35,21 @@ logger = logging.getLogger(__name__)
 class LeaseView:
     """What the scheduler keeps of one lease."""
 
-    __slots__ = ("lease", "prefix_slots", "pending_slots")
+    __slots__ = ("lease", "prefix_slots", "pending_slots", "pending_state")
 
-    def __init__(self, lease: int, prefix_slots: Optional[torch.Tensor]):
+    def __init__(
+        self,
+        lease: int,
+        prefix_slots: Optional[torch.Tensor],
+        state: Optional[StateGrant],
+    ):
         self.lease = lease
         # Slot ids of the shared prefix, until written into the request's row.
         self.prefix_slots = prefix_slots
         # Slot ids granted for positions not yet written into the row.
         self.pending_slots: list[torch.Tensor] = []
+        # Recurrent-state slots, until bound to the request.
+        self.pending_state = state
 
 
 class BorrowCacheClient:
@@ -100,9 +109,11 @@ class BorrowCacheClient:
             )
         )
         if res.status == AcquireStatus.GRANTED:
-            view = LeaseView(res.lease, res.shared_slots)
+            view = LeaseView(res.lease, res.shared_slots, res.state)
             view.pending_slots.append(res.mut_slots)
             self._views[req.rid] = view
+            if res.state is not None:
+                req.mamba_branching_seqlen = res.state.branch_len
         return res
 
     def grow_chunk(
@@ -170,18 +181,34 @@ class BorrowCacheClient:
         mut = pending[0] if len(pending) == 1 else torch.cat(pending)
         return prefix, mut
 
-    def publish(self, req: Req, token_ids: Sequence[int]) -> None:
-        self.service.release_mut(self._views[req.rid].lease, token_ids)
+    def take_state(self, req: Req) -> Optional[StateGrant]:
+        """The state slots granted with the lease, once, to bind to the request."""
+        view = self._views[req.rid]
+        state, view.pending_state = view.pending_state, None
+        return state
+
+    def publish(
+        self, req: Req, token_ids: Sequence[int], *, state: Optional[StateAnchor] = None
+    ) -> None:
+        self.service.release_mut(self._views[req.rid].lease, token_ids, state=state)
 
     def rollback(self, req: Req, from_len: int) -> None:
         self.service.release(self._views[req.rid].lease, from_len=from_len)
 
-    def release(self, req: Req, *, publish_token_ids: Optional[Sequence[int]]) -> bool:
+    def release(
+        self,
+        req: Req,
+        *,
+        publish_token_ids: Optional[Sequence[int]],
+        state: Optional[StateAnchor] = None,
+    ) -> bool:
         """End the request's lease; False if it had none (e.g. revoked)."""
         view = self._views.pop(req.rid, None)
         if view is None:
             return False
-        self.service.release(view.lease, publish_token_ids=publish_token_ids)
+        self.service.release(
+            view.lease, publish_token_ids=publish_token_ids, state=state
+        )
         return True
 
     # ===== Batch fences =====

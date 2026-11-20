@@ -6,10 +6,11 @@ table (``req_to_token``) and never frees a slot itself.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from sglang.srt.mem_cache.borrow.api import StateAnchor, StateGrant
 from sglang.srt.mem_cache.allocation import (
     assign_req_to_token_pool_func,
     write_cache_indices,
@@ -40,7 +41,12 @@ def alloc_for_extend(batch: ScheduleBatch):
     pin = is_pin_memory_available(device)
     req_to_token = batch.req_to_token_pool.req_to_token
     holds_row = [r.kv.holds_kv for r in batch.reqs]
+    for req in batch.reqs:
+        if (state := client.take_state(req)) is not None:
+            _bind_state(req, state, table=batch.req_to_token_pool, device=device)
     storage = kv_storage_of(batch.req_to_token_pool, batch.token_to_kv_pool_allocator)
+    # Requests already hold their state slots, so this only binds rows and
+    # writes the state slot ids into the table's mapping columns.
     rows = storage.acquire(batch.reqs)
     if rows is None:
         raise RuntimeError(
@@ -155,10 +161,63 @@ def alloc_for_spec_decode(
         req.kv.allocate_spec_decode(nxt)
 
 
+def _bind_state(req: Req, state: StateGrant, *, table, device) -> None:
+    """Hand the request the state slots its lease borrows, as
+    `StateStorage.acquire` hands out its own (`_hand_out_tracking`). The
+    service already started the working slot, so nothing is cleared or copied
+    on the forward stream."""
+    assert not req.kv.holds_mamba, f"{req.rid} already holds a state slot"
+    size = table.mamba_ping_pong_track_buffer_size
+    tracking = list(state.slots[1:])
+    assert len(tracking) == table.mamba_initial_tracking_slots == size
+    slots = torch.tensor(state.slots, dtype=torch.int64).to(device, non_blocking=True)
+    kv = req.kv
+    kv.mamba_pool_idx = slots[0]
+    kv.mamba_ping_pong_track_buffer = slots[1:]
+    kv.mamba_ping_pong_empty = [False] * size
+    kv.mamba_prev_track_seqlen = None
+    kv.mamba_last_track_seqlen = None
+    kv.mamba_next_track_idx = 0
+    kv.mamba_last_track_idx = table.get_mamba_ping_pong_other_idx(0)
+    kv.mamba_cow_src_index = None
+    kv.mamba_needs_clear = False
+
+
+def _unbind_state(req: Req) -> None:
+    """Forget the lease's state slots; the service reclaims them with the lease."""
+    kv = req.kv
+    kv.mamba_pool_idx = None
+    kv.mamba_ping_pong_track_buffer = None
+    kv.mamba_ping_pong_empty = None
+    kv.mamba_next_track_idx = None
+    kv.mamba_last_track_idx = None
+    kv.mamba_last_track_seqlen = None
+    kv.mamba_prev_track_seqlen = None
+    kv.mamba_cow_src_index = None
+    kv.mamba_needs_clear = False
+
+
+def _state_anchor(req: Req, published_len: int) -> Optional[StateAnchor]:
+    """The latest tracked checkpoint, if it lies within the published tokens.
+
+    Only the most recent tracking slot is offered: the other ping-pong slot may
+    be the target of a forward still in flight.
+    """
+    if not req.kv.holds_mamba:
+        return None
+    length = req.kv.mamba_last_track_seqlen
+    if length is None or length == 0 or length > published_len:
+        return None
+    return StateAnchor(length=length, slot_index=1 + req.kv.mamba_last_track_idx)
+
+
 def checkpoint_kv_cache(req: Req, tree_cache: BorrowTreeFacade) -> None:
     """Publish what a running request computed so far (a chunk end)."""
     if not req.skip_radix_cache_insert:
-        tree_cache.client.publish(req, req.full_untruncated_fill_ids[: req.extend_end])
+        token_ids = req.full_untruncated_fill_ids[: req.extend_end]
+        tree_cache.client.publish(
+            req, token_ids, state=_state_anchor(req, len(token_ids))
+        )
     req.prefix_len = req.extend_end
 
 
@@ -168,12 +227,15 @@ def release_kv_cache(req: Req, tree_cache: BorrowTreeFacade, *, checkpoint: bool
     if not req.kv.holds_kv:
         tree_cache.client.release(req, publish_token_ids=None)
         return
-    publish = None
+    publish = state = None
     if checkpoint and not req.skip_radix_cache_insert:
         req.refresh_fill_ids()
         publish = req.full_untruncated_fill_ids[: req.owned_kv_len()]
-    tree_cache.client.release(req, publish_token_ids=publish)
+        state = _state_anchor(req, len(publish))
+    tree_cache.client.release(req, publish_token_ids=publish, state=state)
     kv_storage_of(
         tree_cache.req_to_token_pool, tree_cache.token_to_kv_pool_allocator
     ).release_row(req)
     req.kv.mark_kv_released()
+    if req.kv.holds_mamba:
+        _unbind_state(req)

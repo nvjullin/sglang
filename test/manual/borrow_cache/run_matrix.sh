@@ -32,6 +32,8 @@ case_args() {
     swa_seq) echo "--num-prefixes 6 --prefix-len 1500 --rounds 2 --prompts-per-round 24 --max-new-tokens 64 --concurrency 1 -- --model-path ${SWA_MODEL:?set SWA_MODEL} $HI $DET --max-total-tokens 8192 --page-size 16 --chunked-prefill-size 1024" ;;
     swa_small) echo "--num-prefixes 6 --prefix-len 1500 --rounds 3 --max-new-tokens 300 -- --model-path ${SWA_MODEL:?set SWA_MODEL} $HI $DET --max-total-tokens 16384 --swa-full-tokens-ratio 0.25 --page-size 16 --chunked-prefill-size 1024" ;;
     swa_small_seq) echo "--num-prefixes 6 --prefix-len 1500 --rounds 2 --prompts-per-round 24 --max-new-tokens 300 --concurrency 1 -- --model-path ${SWA_MODEL:?set SWA_MODEL} $HI $DET --max-total-tokens 16384 --swa-full-tokens-ratio 0.25 --page-size 16 --chunked-prefill-size 1024" ;;
+    # Two TP2/EP2 servers per node (the cookbook serves V4.1 Flash at TP4/EP4).
+    tp2_dsv4) echo "--num-prefixes 4 --prefix-len 3000 --rounds 2 --prompts-per-round 16 --max-new-tokens 64 --concurrency 1 -- --model-path ${DSV4_MODEL:?set DSV4_MODEL} --trust-remote-code --tp 2 --ep-size 2 --max-running-requests 64 --max-total-tokens 65536" ;;
     tp2dp2)  echo "--num-prefixes 8 --prefix-len 1500 --rounds 3 --max-new-tokens 64 -- --model-path $MODEL $HI $DET --max-total-tokens 8192 --page-size 16 --tp 2 --attn-dp-size 2" ;;
     tp2)     echo "--num-prefixes 8 --prefix-len 1500 --rounds 3 --max-new-tokens 128 -- --model-path $MODEL $HI $DET --max-total-tokens 8192 --page-size 16 --chunked-prefill-size 2048 --tp 2" ;;
     *) echo "unknown case $1" >&2; exit 2 ;;

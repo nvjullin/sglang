@@ -73,11 +73,15 @@ class BorrowCacheClient:
         service: KVCacheService,
         page_size: int,
         window: Optional[tuple[int, int]] = None,
+        reprefill_tail: int = 0,
     ):
         self.service = service
         self.page_size = page_size
         # (window tokens, retirement interval) when KV has a window pool.
         self.window = window
+        # Tokens at the end of a prompt never shared: decoder SWA bounded replay
+        # writes late-layer window KV only for an extend's tail rows.
+        self.reprefill_tail = reprefill_tail
         self._views: dict[str, LeaseView] = {}
         self._batch_id = 0
         # Arbitrary; often enough to follow a test run in the server log.
@@ -86,10 +90,11 @@ class BorrowCacheClient:
 
     # ===== Request -> API types =====
 
-    @staticmethod
-    def key_of(req: Req) -> CacheKey:
+    def key_of(self, req: Req) -> CacheKey:
         tokens = req.full_untruncated_fill_ids
         limit = req._compute_max_prefix_len(len(tokens))
+        if self.reprefill_tail:
+            limit = min(limit, max(0, len(tokens) - self.reprefill_tail))
         if req.positional_embed_overrides is not None:
             limit = 0
         return CacheKey(

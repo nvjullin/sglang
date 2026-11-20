@@ -42,6 +42,8 @@ from sglang.srt.mem_cache.memory_pool import (
     MLATokenToKVPool,
     ReqToTokenPool,
 )
+from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
+from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.runtime_context import (
     get_disagg,
@@ -70,13 +72,19 @@ def _unsupported(
     checks = {
         "KV pools other than MHA/MLA/DSA (alone, in a Mamba hybrid pool, or an "
         "MHA full + sliding-window pair)": not _supported_kv_pool(kv_pool),
-        "sliding-window token allocators other than SWATokenToKVPoolAllocator": isinstance(
-            kv_pool, SWAKVPool
+        "sliding-window token allocators other than SWATokenToKVPoolAllocator (paged)": isinstance(
+            kv_pool, BaseSWAKVPool
         )
         and type(allocator) is not SWATokenToKVPoolAllocator,
-        "sliding-window bounded replay": get_exec().features.enable_decoder_swa_bounded_replay
-        or get_exec().features.enable_encoder_swa_bounded_replay,
-        "speculative decoding with a sliding-window pool": isinstance(kv_pool, SWAKVPool)
+        "encoder SWA bounded replay": get_exec().features.enable_encoder_swa_bounded_replay,
+        "decoder SWA bounded replay outside DeepSeek V4 pools": bool(
+            get_exec().features.enable_decoder_swa_bounded_replay
+        )
+        and type(kv_pool) is not DeepSeekV4TokenToKVPool,
+        "the HiCache host tier with DeepSeek V4 pools": type(kv_pool)
+        is DeepSeekV4TokenToKVPool
+        and memory.enable_hierarchical_cache,
+        "speculative decoding with a sliding-window pool": isinstance(kv_pool, BaseSWAKVPool)
         and not spec_algorithm.is_none(),
         "request tables other than ReqToTokenPool (HybridReqToTokenPool with "
         "recurrent state)": type(req_to_token_pool) is not table,
@@ -149,6 +157,10 @@ def _state_host_pool(mamba_pool: Any) -> Any:
 
 
 def _supported_kv_pool(kv_pool: Any) -> bool:
+    if type(kv_pool) is DeepSeekV4TokenToKVPool:
+        # Device only: its compressed KV and indexer rows are full_loc // ratio
+        # sidecars of the full pages; its window KV is the window pool.
+        return True
     if type(kv_pool) is SWAKVPool:
         return all(
             type(p) is MHATokenToKVPool for p in (kv_pool.full_kv_pool, kv_pool.swa_kv_pool)
@@ -311,12 +323,12 @@ def build_borrow_tree_facade(
         if state is None
         else _state_config(state, req_to_token_pool=req_to_token_pool, page_size=page_size),
         window=None
-        if not isinstance(kv_pool, SWAKVPool)
+        if not isinstance(kv_pool, BaseSWAKVPool)
         else _window_config(
             token_to_kv_pool_allocator, page_size=page_size, window=swa_retain_window
         ),
     )
-    if isinstance(kv_pool, SWAKVPool):
+    if isinstance(kv_pool, BaseSWAKVPool):
         # Full pages are no longer capped by the window pool.
         config = msgspec.structs.replace(
             config, num_device_pages=token_to_kv_pool_allocator.size_full // page_size
@@ -375,6 +387,10 @@ def build_borrow_tree_facade(
             window=None
             if config.window is None
             else (config.window.window_tokens, config.window.retire_interval),
+            # As the old tree caps a match under decoder bounded replay.
+            reprefill_tail=swa_retain_window
+            if get_exec().features.enable_decoder_swa_bounded_replay
+            else 0,
         ),
         req_to_token_pool=req_to_token_pool,
         token_to_kv_pool_allocator=token_to_kv_pool_allocator,

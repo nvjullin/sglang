@@ -5,7 +5,7 @@
 #   run_pair.sh <src-root> <log-dir> <compare-args...> -- <server-args...>
 #
 # Env: GPU_A / GPU_B (default 0 / 1), PORT_A / PORT_B (default 30000 / 30001),
-#      TP (default 1; GPU_A/GPU_B then name comma lists).
+#      TP (default 1; GPU_A/GPU_B then name comma lists), READY_SECS (default 1200).
 set -uo pipefail
 SRC=$1; LOG=$2; shift 2
 COMPARE_ARGS=()
@@ -27,7 +27,7 @@ launch() {  # gpu port flag logname
 }
 
 wait_ready() {  # port pid
-  for _ in $(seq 1 600); do
+  for _ in $(seq 1 $(( ${READY_SECS:-1200} / 2 ))); do
     if curl -sf "http://127.0.0.1:$1/health" > /dev/null; then return 0; fi
     if ! kill -0 "$2" 2>/dev/null; then return 1; fi
     sleep 2

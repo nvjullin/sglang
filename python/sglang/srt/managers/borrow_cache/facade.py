@@ -148,6 +148,11 @@ class BorrowTreeFacade(BasePrefixCache):
             full_capacity=st.device_slots,
         )
 
+    def host_tier_usage(self) -> tuple[int, int]:
+        """(used, total) host-tier tokens as the cache service reports them."""
+        st = self.client.service.stats()
+        return st.host_slots - st.host_free_slots, st.host_slots
+
     def available_and_evictable_str(self) -> str:
         st = self.client.service.stats()
         return (

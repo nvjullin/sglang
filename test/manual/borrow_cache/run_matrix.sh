@@ -6,7 +6,8 @@ set -uo pipefail
 SRC=$1; ROOT=$2; shift 2
 MODEL=${MODEL:-Qwen/Qwen3-0.6B}
 DET="--enable-deterministic-inference --attention-backend triton"
-HI="--enable-hierarchical-cache --hicache-ratio 4"
+# --enable-metrics: deployments (srt-slurm) always set it; its idle stats path reads the cache.
+HI="--enable-hierarchical-cache --hicache-ratio 4 --enable-metrics"
 
 case_args() {
   case $1 in

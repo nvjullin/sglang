@@ -1212,6 +1212,11 @@ class SchedulerMetricsReporter:
         """
         if not self.scheduler.enable_hierarchical_cache:
             return
+        if self.scheduler.tree_cache.lends_kv:
+            used, total = self.scheduler.tree_cache.host_tier_usage()
+            self.stats.hicache_host_used_tokens = used
+            self.stats.hicache_host_total_tokens = total
+            return
 
         host_pool = getattr(
             self.scheduler.tree_cache, "token_to_kv_pool_host", None

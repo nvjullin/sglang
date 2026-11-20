@@ -26,12 +26,29 @@ from sglang.srt.mem_cache.borrow.api import (
     LeaseAttrs,
     QueryResult,
     Revoked,
+    StateAnchor,
+    StateGrant,
 )
 from sglang.srt.mem_cache.borrow.hicache.page_allocator import PageAllocator
 from sglang.srt.mem_cache.borrow.hicache.radix_index import Node, PrefixIndex
-from sglang.srt.mem_cache.borrow.hicache.transfer import DataPlane
+from sglang.srt.mem_cache.borrow.hicache.transfer import DataPlane, StatePlane
 
 logger = logging.getLogger(__name__)
+
+
+class StateConfig(msgspec.Struct, frozen=True):
+    """Recurrent-state caching (Mamba / GDN / KDA layers)."""
+
+    # Device state slots [first_slot, first_slot + num_slots).
+    num_slots: int
+    first_slot: int
+    # Tracking slots granted per lease next to its working slot.
+    tracking_slots: int
+    # Branch points land on multiples of this (a multiple of the page size).
+    checkpoint_grid: int
+    # A running lease's state at the end of its prompt is cached too (a PD
+    # prefill worker hands the request off there).
+    publish_at_prompt_end: bool = False
 
 
 class ServiceConfig(msgspec.Struct, frozen=True):
@@ -42,6 +59,7 @@ class ServiceConfig(msgspec.Struct, frozen=True):
     init_new_token_ratio: float = 0.7
     min_new_token_ratio: float = 0.1
     new_token_ratio_decay: float = 0.001
+    state: Optional[StateConfig] = None
 
 
 class Lease:
@@ -54,6 +72,9 @@ class Lease:
         "pages",
         "private",
         "attrs",
+        "state_slots",
+        "branch_len",
+        "adopted_len",
     )
 
     def __init__(self, *, id: int, namespace: tuple, node: Node, attrs: LeaseAttrs):
@@ -68,18 +89,40 @@ class Lease:
         self.pages: list[int] = []
         self.private: list[bool] = []
         self.attrs = attrs
+        # Working slot, then tracking slots; all freed when the lease ends.
+        self.state_slots: list[int] = []
+        self.branch_len: Optional[int] = None
+        # States at lengths <= adopted_len are cached or were offered already.
+        self.adopted_len = 0
 
     def decode_phase(self) -> bool:
         return self.total_len >= self.attrs.prompt_len
 
 
 class HiCacheService(KVCacheService):
-    def __init__(self, *, config: ServiceConfig, data_plane: Optional[DataPlane]):
+    def __init__(
+        self,
+        *,
+        config: ServiceConfig,
+        data_plane: Optional[DataPlane],
+        state_plane: Optional[StatePlane] = None,
+    ):
+        assert (config.state is None) == (state_plane is None)
+        if config.state is not None:
+            assert config.state.checkpoint_grid % config.page_size == 0
         self.cfg = config
         self.ps = config.page_size
         self.index = PrefixIndex(page_size=self.ps)
         self.device = PageAllocator(num_pages=config.num_device_pages, first_page=1)
         self.dp = data_plane
+        self.sp = state_plane
+        self.states = (
+            None
+            if config.state is None
+            else PageAllocator(
+                num_pages=config.state.num_slots, first_page=config.state.first_slot
+            )
+        )
         self.leases: dict[int, Lease] = {}
         self._next_lease = 1
         self._latest_done: Any = None
@@ -93,6 +136,10 @@ class HiCacheService(KVCacheService):
             evicted_device_pages=0,
             evicted_host_pages=0,
             backed_up_pages=0,
+            state_device_hits=0,
+            state_host_loads=0,
+            states_published=0,
+            states_backed_up=0,
         )
 
     # ===== Helpers =====
@@ -125,9 +172,11 @@ class HiCacheService(KVCacheService):
         """Allocate device pages, evicting unborrowed cache if needed."""
         short = num_pages - self.device.num_free
         if short > 0:
-            freed = self.index.evict_device(short)
-            self.counters["evicted_device_pages"] += len(freed)
-            self.device.free(freed)
+            ev = self.index.evict_device(short)
+            self.counters["evicted_device_pages"] += len(ev.pages)
+            self.device.free(ev.pages)
+            if ev.states:
+                self.states.free(ev.states)
         return self.device.alloc(num_pages)
 
     def _take_host(self, num_pages: int) -> Optional[list[int]]:
@@ -135,10 +184,27 @@ class HiCacheService(KVCacheService):
             return None
         short = num_pages - self.dp.host_num_pages_free()
         if short > 0:
-            freed = self.index.evict_host(short)
-            self.counters["evicted_host_pages"] += len(freed)
-            self.dp.free_host(freed)
+            ev = self.index.evict_host(short)
+            self.counters["evicted_host_pages"] += len(ev.pages)
+            self.dp.free_host(ev.pages)
+            if ev.states:
+                self.sp.free_host(ev.states)
         return self.dp.alloc_host(num_pages)
+
+    def _take_states(self, num: int, *, keep: Optional[Node]) -> Optional[list[int]]:
+        """Allocate device state slots, evicting cached states (not ``keep``'s)."""
+        short = num - self.states.num_free
+        if short > 0:
+            self.states.free(self.index.evict_states(short, keep=keep))
+        return self.states.alloc(num)
+
+    def _take_host_state(self) -> Optional[int]:
+        if self.sp.host_num_slots == 0:
+            return None
+        if self.sp.host_num_free() == 0:
+            self.sp.free_host(self.index.evict_host_states(1))
+        got = self.sp.alloc_host(1)
+        return None if got is None else got[0]
 
     # ===== Verbs =====
 
@@ -164,8 +230,14 @@ class HiCacheService(KVCacheService):
         events, self._events = self._events, []
         return AcquireBatch(results=results, events=events)
 
-    def release_mut(self, lease: int, token_ids: Sequence[int]) -> None:
-        self._publish(self.leases[lease], token_ids)
+    def release_mut(
+        self,
+        lease: int,
+        token_ids: Sequence[int],
+        *,
+        state: Optional[StateAnchor] = None,
+    ) -> None:
+        self._publish(self.leases[lease], token_ids, state=state, running=True)
 
     def release(
         self,
@@ -173,10 +245,11 @@ class HiCacheService(KVCacheService):
         *,
         from_len: int = 0,
         publish_token_ids: Optional[Sequence[int]] = None,
+        state: Optional[StateAnchor] = None,
     ) -> None:
         l = self.leases[lease]
         if publish_token_ids is not None:
-            self._publish(l, publish_token_ids)
+            self._publish(l, publish_token_ids, state=state, running=from_len > 0)
         if from_len == 0:
             self._end(l)
             return
@@ -191,9 +264,14 @@ class HiCacheService(KVCacheService):
         return events
 
     def begin_batch(self, batch_id: int, leases: Sequence[int]) -> Optional[Fence]:
-        if self.dp is None:
-            return None
-        return self.dp.launch_loads(after=self._latest_done)
+        fence = None if self.dp is None else self.dp.launch_loads(after=self._latest_done)
+        if self.sp is None:
+            return fence
+        event = self.sp.fence_event(also_after=None if fence is None else fence.final_event)
+        if event is None:
+            return fence
+        index = -1 if fence is None else fence.consumer_index
+        return Fence(consumer_index=index, final_event=event)
 
     def end_batch(self, batch_id: int, done_event: Any) -> list:
         self._latest_done = done_event
@@ -204,36 +282,38 @@ class HiCacheService(KVCacheService):
     def _open(self, r: AcquireReq) -> AcquireResult:
         ns = r.key.namespace
         path = self.index.match(ns, r.key.token_ids)
-        n_dev = sum(1 for n in path.nodes if n.device_pages is not None)
-        dev_nodes, host_nodes = path.nodes[:n_dev], path.nodes[n_dev:]
-        anchor = dev_nodes[-1] if dev_nodes else self.index.root
-        self.index.lock(anchor)
-        if self.dp is None:
-            host_nodes = []
-        plan = self._plan_open(r, host_nodes, path.device_len)
+        nodes = path.nodes
+        n_dev = sum(1 for n in nodes if n.device_pages is not None)
+        guard = nodes[n_dev - 1] if n_dev else self.index.root
+        self.index.lock(guard)
+        plan = None
+        if self._state_slots_fit():
+            plan = self._plan_open(r, nodes, n_dev, self._open_options(nodes, n_dev))
         if plan is None:
-            self.index.unlock(anchor)
+            self.index.unlock(guard)
             self.counters["refused"] += 1
             return AcquireResult(status=AcquireStatus.REFUSED)
-        loaded_nodes, end = plan
-        loaded = self._load(loaded_nodes)
-        if loaded_nodes:
-            self.index.lock(loaded_nodes[-1])
-            self.index.unlock(anchor)
-            anchor = loaded_nodes[-1]
-        shared_len = path.device_len + loaded
+        k, end = plan
+        loaded = self._load(nodes[n_dev:k])
+        anchor = nodes[k - 1] if k else self.index.root
+        self.index.lock(anchor)
+        self.index.unlock(guard)
+        shared_len = sum(len(n.tokens) for n in nodes[:k])
         mut_pages = self._take(self._pages_for(end) - shared_len // self.ps)
         assert mut_pages is not None, "headroom check admitted an unallocatable lease"
         lease = Lease(id=self._next_lease, namespace=ns, node=anchor, attrs=r.attrs)
         self._next_lease += 1
-        for n in dev_nodes + loaded_nodes:
+        for n in nodes[:k]:
             lease.pages.extend(n.device_pages)
         lease.private = [False] * len(lease.pages) + [True] * len(mut_pages)
         lease.pages.extend(mut_pages)
-        lease.shared_len = shared_len
+        lease.shared_len = lease.adopted_len = shared_len
         lease.total_len = end
+        state = None
+        if self.states is not None:
+            state = self._grant_state(lease, path.device_len + path.host_len)
         self.leases[lease.id] = lease
-        self.counters["device_hit_tokens"] += path.device_len
+        self.counters["device_hit_tokens"] += min(path.device_len, shared_len)
         self.counters["loaded_tokens"] += loaded
         return AcquireResult(
             status=AcquireStatus.GRANTED,
@@ -243,7 +323,53 @@ class HiCacheService(KVCacheService):
             shared_slots=self._slots(lease.pages, 0, shared_len),
             mut_slots=self._slots(lease.pages, shared_len, end),
             loaded_len=loaded,
+            state=state,
         )
+
+    def _open_options(self, nodes: list[Node], n_dev: int) -> list[int]:
+        """Candidate shared prefixes, best first, as counts of matched nodes:
+        load the host-only part, else share the device-resident part. With
+        recurrent state a shared prefix must end where a state is cached."""
+        top = len(nodes) if self.dp is not None else n_dev
+        if self.states is not None:
+            with_state = [i + 1 for i in range(top) if self._has_state(nodes[i])]
+            top = with_state[-1] if with_state else 0
+            on_device = [i for i in with_state if i <= n_dev]
+            n_dev = on_device[-1] if on_device else 0
+        return [top, n_dev] if top > n_dev else [n_dev]
+
+    @staticmethod
+    def _has_state(node: Node) -> bool:
+        return node.state is not None or node.host_state is not None
+
+    def _state_slots_fit(self) -> bool:
+        if self.states is None:
+            return True
+        need = 1 + self.cfg.state.tracking_slots
+        # The anchor's own state is never evicted for its lease.
+        return self.states.num_free + self.index.num_states - 1 >= need
+
+    def _grant_state(self, lease: Lease, full_hit: int) -> StateGrant:
+        """Take the lease's state slots and start its working slot at the
+        state after ``shared_len`` positions."""
+        cfg = self.cfg.state
+        anchor = lease.node
+        slots = self._take_states(1 + cfg.tracking_slots, keep=anchor)
+        assert slots is not None, "state headroom check admitted an unfit lease"
+        working, after = slots[0], self._latest_done
+        if anchor.state is not None:
+            self.sp.copy(anchor.state, working, after=after)
+            self.counters["state_device_hits"] += 1
+        elif anchor.host_state is not None:
+            self.sp.load(anchor.host_state, working, after=after)
+            self.counters["state_host_loads"] += 1
+        else:
+            assert anchor is self.index.root, f"shared prefix ends without a state: {anchor}"
+            self.sp.zero(working, after=after)
+        lease.state_slots = slots
+        aligned = full_hit // cfg.checkpoint_grid * cfg.checkpoint_grid
+        lease.branch_len = aligned if aligned > lease.shared_len else None
+        return StateGrant(slots=tuple(slots), branch_len=lease.branch_len)
 
     def _grant_end(self, r: AcquireReq, start: int, room_pages: int) -> Optional[int]:
         """End of the span granted from position ``start`` with ``room_pages``
@@ -262,22 +388,20 @@ class HiCacheService(KVCacheService):
         return end
 
     def _plan_open(
-        self, r: AcquireReq, host_nodes: list[Node], device_len: int
-    ) -> Optional[tuple[list[Node], int]]:
-        """Pick (host nodes to load, granted end): load if it fits, else recompute."""
+        self, r: AcquireReq, nodes: list[Node], n_dev: int, options: list[int]
+    ) -> Optional[tuple[int, int]]:
+        """Pick (shared node count, granted end): the first option that fits.
+        Nodes past ``n_dev`` are host-only and must be loaded."""
         own_reserve = self._pages_for(
             math.ceil(r.attrs.max_new_tokens * self.new_token_ratio)
         )
         room = self._headroom(self._reserved()) - own_reserve
-        options = [([], device_len)]
-        if host_nodes:
-            host_len = sum(len(n.tokens) for n in host_nodes)
-            options.insert(0, (host_nodes, device_len + host_len))
-        for loaded_nodes, shared in options:
-            load_pages = (shared - device_len) // self.ps
+        for k in options:
+            load_pages = sum(len(n.host_pages) for n in nodes[n_dev:k])
+            shared = sum(len(n.tokens) for n in nodes[:k])
             end = self._grant_end(r, shared, room - load_pages)
             if load_pages <= room and end is not None:
-                return loaded_nodes, end
+                return k, end
         return None
 
     def _load(self, nodes: list[Node]) -> int:
@@ -371,7 +495,19 @@ class HiCacheService(KVCacheService):
 
     # ===== Publish / end =====
 
-    def _publish(self, lease: Lease, token_ids: Sequence[int]) -> None:
+    def _publish(
+        self,
+        lease: Lease,
+        token_ids: Sequence[int],
+        *,
+        state: Optional[StateAnchor],
+        running: bool,
+    ) -> None:
+        self._publish_kv(lease, token_ids)
+        if state is not None and self.states is not None:
+            self._publish_state(lease, token_ids, state, running=running)
+
+    def _publish_kv(self, lease: Lease, token_ids: Sequence[int]) -> None:
         upto = len(token_ids)
         assert upto <= lease.total_len, (upto, lease.total_len)
         pub = upto // self.ps * self.ps
@@ -388,6 +524,40 @@ class HiCacheService(KVCacheService):
         lease.shared_len = pub
         if self.dp is not None and out.new_resident:
             self._write_through(out.last_node)
+
+    def _publish_state(
+        self, lease: Lease, token_ids: Sequence[int], anchor: StateAnchor, *, running: bool
+    ) -> None:
+        """Cache a copy of the offered state when its position is a page
+        boundary inside the published prefix. A running lease offers states as
+        it goes; only its branch point (and, on a PD prefill worker, its prompt
+        end) is kept, so a path does not fill up with states."""
+        cfg = self.cfg.state
+        length = anchor.length
+        if length <= lease.adopted_len or length % self.ps or length > lease.shared_len:
+            return
+        if running and length != lease.branch_len:
+            at_prompt_end = len(token_ids) >= lease.attrs.prompt_len
+            if not (cfg.publish_at_prompt_end and at_prompt_end):
+                return
+        lease.adopted_len = length
+        node = self.index.node_at(lease.namespace, token_ids[:length])
+        if self._has_state(node):
+            return
+        got = self._take_states(1, keep=None)
+        if got is None:
+            return
+        slot, after = got[0], self._latest_done
+        self.sp.copy(lease.state_slots[anchor.slot_index], slot, after=after)
+        self.index.set_state(node, slot)
+        self.counters["states_published"] += 1
+        if node.host_pages is None:
+            return
+        host = self._take_host_state()
+        if host is not None:
+            self.sp.backup(slot, host, after=after)
+            self.index.set_host_state(node, host)
+            self.counters["states_backed_up"] += 1
 
     def _write_through(self, node: Node) -> None:
         nodes = self.index.unbacked_on_path(node)
@@ -410,6 +580,8 @@ class HiCacheService(KVCacheService):
     def _end(self, lease: Lease) -> None:
         self.index.unlock(lease.node)
         self.device.free([p for p, own in zip(lease.pages, lease.private) if own])
+        if lease.state_slots:
+            self.states.free(lease.state_slots)
         del self.leases[lease.id]
 
     # ===== Control plane =====
@@ -426,6 +598,9 @@ class HiCacheService(KVCacheService):
             host_slots=0 if self.dp is None else self.dp.host_num_pages * ps,
             host_free_slots=0 if self.dp is None else self.dp.host_num_pages_free() * ps,
             open_leases=len(self.leases),
+            state_slots=0 if self.states is None else self.states.num_pages,
+            state_free_slots=0 if self.states is None else self.states.num_free,
+            cached_states=self.index.num_states,
             counters=dict(self.counters),
         )
 
@@ -433,11 +608,17 @@ class HiCacheService(KVCacheService):
         if self.leases:
             return False
         device, host = self.index.drop_all()
-        self.device.free(device)
+        self.device.free(device.pages)
         if self.dp is not None:
-            self.dp.free_host(host)
+            self.dp.free_host(host.pages)
+        if self.states is not None:
+            self.states.free(device.states)
+            if host.states:
+                self.sp.free_host(host.states)
         return True
 
     def close(self) -> None:
         if self.dp is not None:
             self.dp.close()
+        if self.sp is not None:
+            self.sp.close()

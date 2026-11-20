@@ -7,6 +7,10 @@ Invariants:
 - ``lock_ref`` counts leases whose shared prefix ends at or below the node;
   only device-resident nodes are ever locked.
 - Recency uses a logical clock, so every replica evicts the same nodes.
+- A node's recurrent ``state`` (device slot) / ``host_state`` (host slot) is
+  the state after the node's last token; a device state needs device pages and
+  a host state needs host pages. States carry no locks: every reader of a
+  state slot is ordered before its reuse on the service's state stream.
 """
 
 from __future__ import annotations
@@ -29,6 +33,8 @@ class Node:
         "last_access",
         "d2h_op",
         "h2d_op",
+        "state",
+        "host_state",
     )
 
     def __init__(self, *, id: int, parent: Optional[Node], tokens: tuple):
@@ -43,11 +49,14 @@ class Node:
         # Transfer ops the node's pages take part in; see data_plane.TransferOp.
         self.d2h_op: Any = None
         self.h2d_op: Any = None
+        self.state: Optional[int] = None
+        self.host_state: Optional[int] = None
 
     def __repr__(self) -> str:
         return (
             f"Node(id={self.id}, len={len(self.tokens)}, dev={self.device_pages is not None}, "
-            f"host={self.host_pages is not None}, lock={self.lock_ref})"
+            f"host={self.host_pages is not None}, lock={self.lock_ref}, "
+            f"state={self.state}, host_state={self.host_state})"
         )
 
 
@@ -56,6 +65,12 @@ class MatchPath(msgspec.Struct):
     nodes: list
     device_len: int
     host_len: int
+
+
+class Evicted(msgspec.Struct):
+    pages: list
+    # Recurrent-state slots the evicted nodes held (device or host tier).
+    states: list
 
 
 class InsertOutcome(msgspec.Struct):
@@ -79,6 +94,8 @@ class PrefixIndex:
         self.host_pages_cached = 0
         self._device_leaves: set[Node] = set()
         self._host_leaves: set[Node] = set()
+        self._state_nodes: set[Node] = set()
+        self._host_state_nodes: set[Node] = set()
 
     # ===== Lookup =====
 
@@ -174,6 +191,8 @@ class PrefixIndex:
         head.lock_ref = node.lock_ref
         head.last_access = node.last_access
         head.d2h_op, head.h2d_op = node.d2h_op, node.h2d_op
+        # A state is the state after the node's last token, so it stays with
+        # the tail.
         node.tokens = node.tokens[at:]
         node.parent = head
         parent.children[key] = head
@@ -322,15 +341,77 @@ class PrefixIndex:
         out.reverse()
         return out
 
+    # ===== Recurrent state =====
+
+    def node_at(self, namespace: tuple, tokens: Sequence[int]) -> Node:
+        """The cached node ending exactly after ``tokens`` (page-aligned),
+        splitting one if needed."""
+        assert tokens and len(tokens) % self.page_size == 0
+        node, pos = self.root, 0
+        while pos < len(tokens):
+            child = node.children[self._child_key(node, namespace, tokens, pos)]
+            common = self._common_len(child.tokens, tokens, pos)
+            assert common > 0, f"{len(tokens)} tokens are not cached"
+            if common < len(child.tokens):
+                child = self._split(child, common)
+            pos += common
+            node = child
+        return node
+
+    def set_state(self, node: Node, slot: int) -> None:
+        assert node.state is None and node.device_pages is not None
+        node.state = slot
+        self._state_nodes.add(node)
+
+    def set_host_state(self, node: Node, slot: int) -> None:
+        assert node.host_state is None and node.host_pages is not None
+        node.host_state = slot
+        self._host_state_nodes.add(node)
+
+    def _drop_state(self, node: Node, out: list[int]) -> None:
+        if node.state is not None:
+            out.append(node.state)
+            node.state = None
+            self._state_nodes.discard(node)
+
+    def _drop_host_state(self, node: Node, out: list[int]) -> None:
+        if node.host_state is not None:
+            out.append(node.host_state)
+            node.host_state = None
+            self._host_state_nodes.discard(node)
+
+    @property
+    def num_states(self) -> int:
+        return len(self._state_nodes)
+
+    def evict_states(self, num: int, *, keep: Optional[Node] = None) -> list[int]:
+        """Free up to ``num`` device state slots, LRU first; nodes keep their KV."""
+        order = sorted(
+            (n.last_access, n.id, n) for n in self._state_nodes if n is not keep
+        )
+        out: list[int] = []
+        for _, _, node in order[:num]:
+            self._drop_state(node, out)
+        return out
+
+    def evict_host_states(self, num: int) -> list[int]:
+        """Free up to ``num`` host state slots, LRU first."""
+        order = sorted((n.last_access, n.id, n) for n in self._host_state_nodes)
+        out: list[int] = []
+        for _, _, node in order[:num]:
+            self._drop_host_state(node, out)
+        return out
+
     # ===== Eviction =====
 
     def _device_evictable(self, node: Node) -> bool:
         return node.lock_ref == 0 and (node.h2d_op is None or node.h2d_op.launched)
 
-    def evict_device(self, num_pages: int) -> list[int]:
+    def evict_device(self, num_pages: int) -> Evicted:
         """Free at least ``num_pages`` device pages if possible, LRU first.
 
-        Backed-up nodes are demoted to host-only; others are deleted.
+        Backed-up nodes are demoted to host-only; others are deleted. Device
+        states of evicted nodes are freed with their pages.
         """
         heap = [
             (n.last_access, n.id, n)
@@ -339,6 +420,7 @@ class PrefixIndex:
         ]
         heapq.heapify(heap)
         freed: list[int] = []
+        states: list[int] = []
         while heap and len(freed) < num_pages:
             _, _, node = heapq.heappop(heap)
             if node not in self._device_leaves or not self._device_evictable(node):
@@ -348,6 +430,7 @@ class PrefixIndex:
                     op.wait()
             node.d2h_op = node.h2d_op = None
             freed.extend(node.device_pages)
+            self._drop_state(node, states)
             parent = node.parent
             self._set_device_pages(node, None)
             if node.host_pages is None:
@@ -356,13 +439,14 @@ class PrefixIndex:
                 self._remove_leaf(node)
             if parent in self._device_leaves and self._device_evictable(parent):
                 heapq.heappush(heap, (parent.last_access, parent.id, parent))
-        return freed
+        return Evicted(pages=freed, states=states)
 
-    def evict_host(self, num_pages: int) -> list[int]:
+    def evict_host(self, num_pages: int) -> Evicted:
         """Free at least ``num_pages`` host pages if possible, LRU first."""
         heap = [(n.last_access, n.id, n) for n in self._host_leaves]
         heapq.heapify(heap)
         freed: list[int] = []
+        states: list[int] = []
         while heap and len(freed) < num_pages:
             _, _, node = heapq.heappop(heap)
             if node not in self._host_leaves:
@@ -370,16 +454,19 @@ class PrefixIndex:
             if node.d2h_op is not None:
                 node.d2h_op.wait()
             freed.extend(node.host_pages)
+            self._drop_host_state(node, states)
             parent = node.parent
             self._set_host_pages(node, None)
             self._remove_leaf(node)
             if parent in self._host_leaves:
                 heapq.heappush(heap, (parent.last_access, parent.id, parent))
-        return freed
+        return Evicted(pages=freed, states=states)
 
-    def drop_all(self) -> tuple[list[int], list[int]]:
-        """Remove every node; returns (device pages, host pages). Needs no locks."""
+    def drop_all(self) -> tuple[Evicted, Evicted]:
+        """Remove every node; returns what the device and host tiers held.
+        Needs no locks."""
         device, host, stack = [], [], list(self.root.children.values())
+        states, host_states = [], []
         while stack:
             node = stack.pop()
             assert node.lock_ref == 0
@@ -388,6 +475,8 @@ class PrefixIndex:
                     op.wait()
             device.extend(node.device_pages or ())
             host.extend(node.host_pages or ())
+            self._drop_state(node, states)
+            self._drop_host_state(node, host_states)
             stack.extend(node.children.values())
         self.__init__(page_size=self.page_size)
-        return device, host
+        return Evicted(pages=device, states=states), Evicted(pages=host, states=host_states)

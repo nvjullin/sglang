@@ -57,3 +57,48 @@ class DataPlane(ABC):
 
     @abstractmethod
     def close(self) -> None: ...
+
+
+class StatePlane(ABC):
+    """Recurrent-state slot copies, all on one service stream.
+
+    Every op launches at once, after the event ``after`` (the latest
+    ``end_batch`` done event, so forwards that wrote or read the slots come
+    first); ops run in launch order. A forward that starts after an op waits on
+    ``fence_event``, so a freed slot is reusable as soon as its last op launched.
+    """
+
+    host_num_slots: int
+
+    @abstractmethod
+    def host_num_free(self) -> int: ...
+
+    @abstractmethod
+    def alloc_host(self, num: int) -> Optional[list[int]]: ...
+
+    @abstractmethod
+    def free_host(self, slots: Sequence[int]) -> None: ...
+
+    @abstractmethod
+    def zero(self, slot: int, *, after: Any) -> None: ...
+
+    @abstractmethod
+    def copy(self, src: int, dst: int, *, after: Any) -> None:
+        """Device slot -> device slot."""
+
+    @abstractmethod
+    def load(self, host_slot: int, slot: int, *, after: Any) -> None:
+        """Host slot -> device slot."""
+
+    @abstractmethod
+    def backup(self, slot: int, host_slot: int, *, after: Any) -> None:
+        """Device slot -> host slot."""
+
+    @abstractmethod
+    def fence_event(self, *, also_after: Any) -> Any:
+        """An event completing after every op launched so far (and after
+        ``also_after`` if given); None when nothing launched since the last
+        fence and ``also_after`` is None."""
+
+    @abstractmethod
+    def close(self) -> None: ...

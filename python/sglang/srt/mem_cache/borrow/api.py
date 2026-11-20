@@ -10,6 +10,14 @@ Everything not borrowed belongs to the service, which may evict, move between
 tiers or reuse it. Slot ids returned here index the device KV pools; the runtime
 writes them into its page table (``req_to_token``) and never frees them itself.
 
+Recurrent state (Mamba / GDN / KDA layers): a lease also borrows ``&mut``
+state slots (a working slot plus tracking slots), returned on the opening
+grant. The service initializes the working slot to the state after
+``shared_len`` positions inside the next ``begin_batch`` fence, so
+``shared_len`` is always a position where a cached state exists. Publishing
+may name the lease's state slot that holds the state at a page-aligned length
+(``StateAnchor``); the service copies it, so the slot stays the lease's.
+
 Lockstep: a runtime that replicates its scheduler per rank must issue the same
 calls, in the same order, with the same arguments, on every rank that shares a
 service replica group; answers are then identical on all of them.
@@ -63,6 +71,26 @@ class AcquireReq(msgspec.Struct, frozen=True):
     attrs: LeaseAttrs = LeaseAttrs()
 
 
+class StateGrant(msgspec.Struct, frozen=True):
+    """Recurrent-state slots a lease borrows, as state pool ids.
+
+    ``slots[0]`` is the working slot; the rest are tracking slots the
+    runtime's forwards copy checkpoints into. ``branch_len`` is a position past
+    ``shared_len`` where a checkpoint would extend future hits (None: none).
+    """
+
+    slots: tuple
+    branch_len: Optional[int] = None
+
+
+class StateAnchor(msgspec.Struct, frozen=True):
+    """The state after ``length`` positions is in the lease's state slot
+    ``StateGrant.slots[slot_index]``, written by batches already ended."""
+
+    length: int
+    slot_index: int
+
+
 class AcquireStatus(enum.IntEnum):
     GRANTED = 0
     # Nothing changed; the lease (if any) keeps what it held.
@@ -84,6 +112,8 @@ class AcquireResult(msgspec.Struct, frozen=True):
     mut_slots: Optional[torch.Tensor] = None
     # Of shared_len, tokens brought up from a lower tier for this lease.
     loaded_len: int = 0
+    # Set on the grant that opens a lease when the service caches state.
+    state: Optional[StateGrant] = None
 
 
 class Ready(msgspec.Struct, frozen=True):
@@ -130,6 +160,10 @@ class CacheStats(msgspec.Struct, frozen=True):
     host_slots: int = 0
     host_free_slots: int = 0
     open_leases: int = 0
+    # Recurrent-state slots (0 without recurrent layers).
+    state_slots: int = 0
+    state_free_slots: int = 0
+    cached_states: int = 0
     counters: dict = {}
 
 
@@ -147,11 +181,18 @@ class KVCacheService(ABC):
         other leases; their results come back as events."""
 
     @abstractmethod
-    def release_mut(self, lease: int, token_ids: Sequence[int]) -> None:
+    def release_mut(
+        self,
+        lease: int,
+        token_ids: Sequence[int],
+        *,
+        state: Optional[StateAnchor] = None,
+    ) -> None:
         """Publish ``[0, len(token_ids))``: downgrade ``&mut`` to ``&``.
 
         ``token_ids`` are the tokens at those positions. Valid only after the
-        ``end_batch`` of every batch that wrote them.
+        ``end_batch`` of every batch that wrote them. ``state`` offers a
+        checkpoint the service may cache (it decides which ones to keep).
         """
 
     @abstractmethod
@@ -161,9 +202,11 @@ class KVCacheService(ABC):
         *,
         from_len: int = 0,
         publish_token_ids: Optional[Sequence[int]] = None,
+        state: Optional[StateAnchor] = None,
     ) -> None:
-        """Publish ``publish_token_ids`` if given, then drop every borrow at
-        positions ``>= from_len``. ``from_len == 0`` ends the lease."""
+        """Publish ``publish_token_ids`` (with ``state``) if given, then drop
+        every borrow at positions ``>= from_len``. ``from_len == 0`` ends the
+        lease and its state slots."""
 
     @abstractmethod
     def poll(self) -> list:

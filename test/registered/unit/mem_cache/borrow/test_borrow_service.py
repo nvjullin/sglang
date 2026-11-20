@@ -14,11 +14,21 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from fake_runtime import FakeDataPlane, FakeReq, FakeRuntime, kv_content
+from fake_runtime import (
+    FakeDataPlane,
+    FakeReq,
+    FakeRuntime,
+    FakeStatePlane,
+    kv_content,
+)
 
 from sglang.srt.mem_cache.borrow.api import AcquireReq, CacheKey, LeaseAttrs
 from sglang.srt.mem_cache.borrow.hicache.page_allocator import PageAllocator
-from sglang.srt.mem_cache.borrow.hicache.service import HiCacheService, ServiceConfig
+from sglang.srt.mem_cache.borrow.hicache.service import (
+    HiCacheService,
+    ServiceConfig,
+    StateConfig,
+)
 from sglang.srt.mem_cache.borrow.threaded import CacheServiceError, ThreadedService
 
 
@@ -34,6 +44,47 @@ def make(page_size=4, device_pages=32, host_pages=64, with_host=True):
         data_plane=dp,
     )
     return svc, FakeRuntime(svc, kv)
+
+
+def make_state(
+    page_size=4,
+    device_pages=32,
+    host_pages=64,
+    state_slots=12,
+    host_states=16,
+    grid=8,
+    with_host=True,
+    prompt_end=False,
+):
+    kv = np.full((device_pages + 1) * page_size, -1, dtype=np.int64)
+    dp = (
+        FakeDataPlane(page_size=page_size, host_num_pages=host_pages, device_kv=kv)
+        if with_host
+        else None
+    )
+    sp = FakeStatePlane(num_slots=state_slots + 1, host_num_slots=host_states if with_host else 0)
+    cfg = ServiceConfig(
+        page_size=page_size,
+        num_device_pages=device_pages,
+        state=StateConfig(
+            num_slots=state_slots,
+            first_slot=1,
+            tracking_slots=2,
+            checkpoint_grid=grid,
+            publish_at_prompt_end=prompt_end,
+        ),
+    )
+    svc = HiCacheService(config=cfg, data_plane=dp, state_plane=sp)
+    return svc, FakeRuntime(svc, kv, state=sp, checkpoint_grid=grid)
+
+
+def check_state_accounting(svc: HiCacheService) -> None:
+    """Every state slot is free, cached by one node, or held by one lease."""
+    held = [s for l in svc.leases.values() for s in l.state_slots]
+    cached = [n.state for n in svc.index._state_nodes]
+    both = held + cached
+    assert len(both) == len(set(both)), "a state slot has two owners"
+    assert svc.states.num_free + len(both) == svc.cfg.state.num_slots
 
 
 def check_accounting(svc: HiCacheService) -> None:
@@ -293,14 +344,139 @@ class TestLockstep(unittest.TestCase):
                 self._workload(make(page_size=ps, device_pages=60 // ps + 8, host_pages=80 // ps), seed=seed)
 
 
+class TestRecurrentState(unittest.TestCase):
+    """Leases of models with recurrent layers: the working slot must start at
+    the state after shared_len, which therefore ends where a state is cached."""
+
+    def _run(self, rt, req, *, chunk=None):
+        self.assertTrue(rt.open(req, max_mut_len=chunk))
+        rt.forward([req])
+        while len(req.slots) < len(req.prompt):
+            self.assertTrue(rt.grow_chunk(req, max_mut_len=chunk))
+            rt.forward([req])
+
+    def test_shared_prefix_is_cut_to_the_deepest_cached_state(self):
+        """KV is cached for 36 tokens but the only state is at 24; a hit shares
+        24 positions, and the branch point is the last grid multiple of the KV hit."""
+        svc, rt = make_state(page_size=4, grid=8)
+        prompt = list(range(1, 38))
+        a = FakeReq(1, prompt, max_new=0)
+        self._run(rt, a)
+        # One forward over 37 tokens tracked the state at 32; offer 24 instead.
+        rt.svc.release(a.lease, publish_token_ids=prompt[:36], state=None)
+        b = FakeReq(2, prompt[:24] + [99] * 4, max_new=0)
+        self._run(rt, b)
+        rt.finish(b)
+        c = FakeReq(3, prompt + [5], max_new=0)
+        self.assertTrue(rt.open(c))
+        self.assertEqual(c.computed, 24)
+        self.assertEqual(c.branch_len, 32)
+        rt.forward([c])
+        self.assertEqual(svc.counters["state_device_hits"], 1)
+        check_state_accounting(svc)
+
+    def test_running_lease_keeps_only_its_branch_point(self):
+        """A running publish caches a state only at the lease's branch point;
+        a finished lease's state is cached."""
+        svc, rt = make_state(page_size=4, grid=8)
+        base = list(range(1, 30))
+        a = FakeReq(1, base, max_new=0)
+        self._run(rt, a)
+        rt.svc.release(a.lease, publish_token_ids=base[:28], state=None)
+        b = FakeReq(2, base[:28] + list(range(40, 60)), max_new=0)
+        self.assertTrue(rt.open(b, max_mut_len=4))
+        self.assertEqual((b.computed, b.branch_len), (0, 24))
+        rt.forward([b])
+        while len(b.slots) < len(b.prompt):
+            rt.publish(b)
+            rt.grow_chunk(b, max_mut_len=4)
+            rt.forward([b])
+        self.assertEqual(svc.index.num_states, 1)
+        self.assertEqual(svc.counters["states_published"], 1)
+        rt.finish(b)
+        self.assertEqual(svc.index.num_states, 2)
+        c = FakeReq(3, base[:24] + [7] * 8, max_new=0)
+        self.assertTrue(rt.open(c))
+        self.assertEqual(c.computed, 24)
+        rt.forward([c])
+
+    def test_prompt_end_publish_on_pd_prefill(self):
+        svc, rt = make_state(page_size=4, grid=8, prompt_end=True)
+        a = FakeReq(1, list(range(1, 34)), max_new=0)
+        self._run(rt, a)
+        rt.publish(a)
+        self.assertEqual(svc.index.num_states, 1)
+
+    def test_state_round_trips_through_the_host_tier(self):
+        """Device eviction frees a node's KV pages and state slot; a later hit
+        loads both from host and the working slot starts at the cached state."""
+        svc, rt = make_state(page_size=4, device_pages=12, grid=8)
+        p1 = list(range(1, 34))
+        a = FakeReq(1, p1, max_new=0)
+        self._run(rt, a)
+        rt.finish(a)
+        for i in range(3):
+            other = FakeReq(10 + i, [50 + i] * 33, max_new=0)
+            self._run(rt, other)
+            rt.finish(other)
+        c = FakeReq(2, p1 + [3], max_new=0)
+        self.assertTrue(rt.open(c))
+        self.assertEqual(c.computed, 32)
+        self.assertGreater(svc.counters["loaded_tokens"], 0)
+        self.assertEqual(svc.counters["state_host_loads"], 1)
+        rt.forward([c])
+        check_state_accounting(svc)
+
+    def test_state_slot_shortage_refuses_and_evicts_cached_states(self):
+        """Leases need 3 state slots each. Cached states are evicted for new
+        leases, LRU first, but a hit never evicts the state it starts from; when
+        leases hold every slot the next open is refused."""
+        svc, rt = make_state(page_size=4, device_pages=64, state_slots=7, grid=8)
+        for i in (1, 3):
+            r = FakeReq(i, [i] * 17, max_new=0)
+            self._run(rt, r)
+            rt.finish(r)
+        b = FakeReq(2, [2] * 17, max_new=0)
+        self._run(rt, b)
+        # Free: 7 - 3 (b) - 2 cached states = 2 < 3. The LRU state is the one
+        # this hit starts from, so the other one goes.
+        hit = FakeReq(5, [1] * 17 + [2], max_new=0)
+        self.assertTrue(rt.open(hit))
+        self.assertEqual(hit.computed, 16)
+        self.assertIsNotNone(svc.leases[hit.lease].node.state)
+        self.assertEqual(svc.index.num_states, 1)
+        self.assertFalse(rt.open(FakeReq(9, [9] * 17, max_new=0)))
+        rt.forward([hit])
+        check_state_accounting(svc)
+
+    def test_random_workloads_keep_state_correct(self):
+        """Mixed chunked prefill, decode, publishes, evictions, loads and
+        revocations: every forward finds its working state correct."""
+        lock = TestLockstep()
+        for seed in range(6):
+            for ps in (1, 4):
+                svc_rt = make_state(
+                    page_size=ps,
+                    device_pages=60 // ps + 8,
+                    host_pages=80 // ps,
+                    state_slots=20,
+                    host_states=6,
+                    grid=4 if ps == 1 else 8,
+                )
+                lock._workload(svc_rt, seed=seed)
+                check_state_accounting(svc_rt[0])
+        st = svc_rt[0].stats().counters
+        self.assertGreater(st["state_host_loads"] + st["state_device_hits"], 0)
+
+
 class TestThreaded(unittest.TestCase):
     def test_runs_on_its_own_thread_in_caller_order(self):
         seen = []
 
         class Probe(HiCacheService):
-            def release_mut(self, lease, token_ids):
+            def release_mut(self, lease, token_ids, *, state=None):
                 seen.append(("release_mut", threading.current_thread().name))
-                super().release_mut(lease, token_ids)
+                super().release_mut(lease, token_ids, state=state)
 
         kv = np.full(33 * 4, -1, dtype=np.int64)
         svc = ThreadedService(

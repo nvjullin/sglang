@@ -23,6 +23,7 @@ from sglang.srt.mem_cache.borrow.api import (
     Fence,
     KVCacheService,
     QueryResult,
+    StateAnchor,
 )
 
 logger = logging.getLogger(__name__)
@@ -117,8 +118,14 @@ class ThreadedService(KVCacheService):
     def acquire(self, reqs: Sequence[AcquireReq]) -> AcquireBatch:
         return self._call("acquire", reqs)
 
-    def release_mut(self, lease: int, token_ids: Sequence[int]) -> None:
-        self._post("release_mut", lease, token_ids)
+    def release_mut(
+        self,
+        lease: int,
+        token_ids: Sequence[int],
+        *,
+        state: Optional[StateAnchor] = None,
+    ) -> None:
+        self._post("release_mut", lease, token_ids, state=state)
 
     def release(
         self,
@@ -126,9 +133,14 @@ class ThreadedService(KVCacheService):
         *,
         from_len: int = 0,
         publish_token_ids: Optional[Sequence[int]] = None,
+        state: Optional[StateAnchor] = None,
     ) -> None:
         self._post(
-            "release", lease, from_len=from_len, publish_token_ids=publish_token_ids
+            "release",
+            lease,
+            from_len=from_len,
+            publish_token_ids=publish_token_ids,
+            state=state,
         )
 
     def poll(self) -> list:

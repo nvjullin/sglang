@@ -3,7 +3,8 @@
 KV content of position ``p`` of a sequence is a function of the namespace and
 tokens ``[0, p]``, like real KV. The fake data plane copies contents between a
 device array and a host array, so tests can check that every slot a lease
-borrows holds the KV its position needs.
+borrows holds the KV its position needs. Recurrent state after ``n`` tokens is
+likewise a function of the namespace and tokens ``[0, n)``.
 """
 
 from __future__ import annotations
@@ -20,13 +21,24 @@ from sglang.srt.mem_cache.borrow.api import (
     Fence,
     KVCacheService,
     LeaseAttrs,
+    StateAnchor,
 )
 from sglang.srt.mem_cache.borrow.hicache.page_allocator import PageAllocator
-from sglang.srt.mem_cache.borrow.hicache.transfer import DataPlane, TransferOp
+from sglang.srt.mem_cache.borrow.hicache.transfer import (
+    DataPlane,
+    StatePlane,
+    TransferOp,
+)
 
 
 def kv_content(namespace: tuple, tokens: Sequence[int], pos: int) -> int:
     return hash((namespace, tuple(tokens[: pos + 1]))) & 0x7FFFFFFFFFFF
+
+
+def state_content(namespace: tuple, tokens: Sequence[int], length: int) -> int:
+    if length == 0:
+        return 0
+    return hash(("state", namespace, tuple(tokens[:length]))) & 0x7FFFFFFFFFFF
 
 
 class FakeOp(TransferOp):
@@ -88,6 +100,52 @@ class FakeDataPlane(DataPlane):
         pass
 
 
+class FakeStatePlane(StatePlane):
+    """Runs every op at launch; the fake runtime's forwards come later, as
+    real forwards wait on the fence."""
+
+    def __init__(self, *, num_slots: int, host_num_slots: int):
+        self.device = np.full(num_slots, -1, dtype=np.int64)
+        self.host = np.full(max(host_num_slots, 1), -1, dtype=np.int64)
+        self.host_num_slots = host_num_slots
+        self._host = PageAllocator(num_pages=host_num_slots)
+        self._unfenced = False
+
+    def host_num_free(self) -> int:
+        return self._host.num_free
+
+    def alloc_host(self, num: int) -> Optional[list[int]]:
+        return self._host.alloc(num)
+
+    def free_host(self, slots: Sequence[int]) -> None:
+        self._host.free(slots)
+
+    def zero(self, slot: int, *, after: Any) -> None:
+        self.device[slot] = 0
+        self._unfenced = True
+
+    def copy(self, src: int, dst: int, *, after: Any) -> None:
+        self.device[dst] = self.device[src]
+        self._unfenced = True
+
+    def load(self, host_slot: int, slot: int, *, after: Any) -> None:
+        self.device[slot] = self.host[host_slot]
+        self._unfenced = True
+
+    def backup(self, slot: int, host_slot: int, *, after: Any) -> None:
+        self.host[host_slot] = self.device[slot]
+        self._unfenced = True
+
+    def fence_event(self, *, also_after: Any) -> Any:
+        if not self._unfenced and also_after is None:
+            return None
+        self._unfenced = False
+        return "state-fence"
+
+    def close(self) -> None:
+        pass
+
+
 class FakeReq:
     def __init__(self, rid: int, prompt: list[int], max_new: int, namespace: tuple = ()):
         self.rid = rid
@@ -98,6 +156,12 @@ class FakeReq:
         self.lease: Optional[int] = None
         self.slots: list[int] = []
         self.computed = 0
+        # Recurrent state: working slot, tracking slots, the last tracked
+        # checkpoint (length, index into state_slots), next tracking index.
+        self.state_slots: list[int] = []
+        self.branch_len: Optional[int] = None
+        self.tracked: Optional[tuple[int, int]] = None
+        self.next_track = 0
 
     @property
     def tokens(self) -> list[int]:
@@ -107,9 +171,19 @@ class FakeReq:
 class FakeRuntime:
     """Drives a service like a scheduler: open, write KV, publish, decode, end."""
 
-    def __init__(self, service: KVCacheService, device_kv: np.ndarray, *, seed: int = 0):
+    def __init__(
+        self,
+        service: KVCacheService,
+        device_kv: np.ndarray,
+        *,
+        seed: int = 0,
+        state: Optional[FakeStatePlane] = None,
+        checkpoint_grid: int = 0,
+    ):
         self.svc = service
         self.kv = device_kv
+        self.state = state
+        self.grid = checkpoint_grid
         self.rng = random.Random(seed)
         self.batch_id = 0
         self.revoked: list[FakeReq] = []
@@ -136,6 +210,11 @@ class FakeRuntime:
         req.slots = res.shared_slots.tolist() + res.mut_slots.tolist()
         req.computed = res.shared_len
         assert len(req.slots) == res.total_len
+        assert (res.state is not None) == (self.state is not None)
+        if res.state is not None:
+            req.state_slots = list(res.state.slots)
+            req.branch_len = res.state.branch_len
+            req.tracked, req.next_track = None, 0
         return True
 
     def grow_chunk(self, req: FakeReq, *, max_mut_len: int) -> bool:
@@ -160,6 +239,8 @@ class FakeRuntime:
         """One batch: wait for loads, check shared KV, write the computed KV."""
         self.batch_id += 1
         fence = self.svc.begin_batch(self.batch_id, [r.lease for r in reqs])
+        if self.state is not None:
+            assert self.state._unfenced is False, "state ops launched after the fence"
         for r in reqs:
             toks = r.tokens
             for p in range(r.computed):
@@ -168,12 +249,40 @@ class FakeRuntime:
                 )
             for p in range(r.computed, len(r.slots)):
                 self.kv[r.slots[p]] = kv_content(r.namespace, toks, p)
+            if self.state is not None:
+                self._advance_state(r, toks, len(r.slots))
             r.computed = len(r.slots)
         self.svc.end_batch(self.batch_id, done_event=None)
         return fence
 
+    def _advance_state(self, r: FakeReq, toks: list[int], end: int) -> None:
+        """Check the working state, run it to ``end`` and track one checkpoint:
+        the branch point if crossed, else the last grid multiple crossed."""
+        dev = self.state.device
+        assert dev[r.state_slots[0]] == state_content(r.namespace, toks, r.computed), (
+            f"rid={r.rid} working state is not the state after {r.computed} tokens"
+        )
+        dev[r.state_slots[0]] = state_content(r.namespace, toks, end)
+        if r.branch_len is not None and r.computed < r.branch_len <= end:
+            boundary = r.branch_len
+        else:
+            boundary = end // self.grid * self.grid
+            if boundary <= r.computed:
+                return
+        idx = 1 + r.next_track
+        dev[r.state_slots[idx]] = state_content(r.namespace, toks, boundary)
+        r.tracked = (boundary, idx)
+        r.next_track = (r.next_track + 1) % (len(r.state_slots) - 1)
+
+    def _anchor(self, req: FakeReq) -> Optional[StateAnchor]:
+        if req.tracked is None:
+            return None
+        return StateAnchor(length=req.tracked[0], slot_index=req.tracked[1])
+
     def publish(self, req: FakeReq) -> None:
-        self.svc.release_mut(req.lease, req.tokens[: req.computed])
+        self.svc.release_mut(
+            req.lease, req.tokens[: req.computed], state=self._anchor(req)
+        )
 
     def decode(self, reqs: Sequence[FakeReq], *, k: int = 1) -> list[FakeReq]:
         """Grow every request by k positions; returns the survivors."""
@@ -187,6 +296,7 @@ class FakeRuntime:
         for r, res in zip(reqs, batch.results):
             if res.status == AcquireStatus.REVOKED:
                 r.lease, r.slots, r.computed = None, [], 0
+                r.state_slots, r.tracked = [], None
                 self.revoked.append(r)
                 continue
             assert res.status == AcquireStatus.GRANTED
@@ -199,5 +309,7 @@ class FakeRuntime:
         self.svc.release(
             req.lease,
             publish_token_ids=req.tokens[: req.computed] if publish else None,
+            state=self._anchor(req) if publish else None,
         )
         req.lease = None
+        req.state_slots, req.tracked = [], None

@@ -212,6 +212,29 @@ class TestGrowth(unittest.TestCase):
         check_accounting(svc)
         check_exclusive_mut(svc)
 
+    def test_growth_to_a_covered_end_keeps_the_lease(self):
+        """Spec decoding reserves ahead: a step whose end the lease already
+        covers grants nothing and must not shrink the lease."""
+        svc, rt = make(page_size=4, device_pages=32, with_host=False)
+        a = FakeReq(1, list(range(1, 8)), max_new=50)
+        rt.open(a)
+        rt.forward([a])
+        lease = svc.leases[a.lease]
+        res = svc.acquire([AcquireReq(end=16, lease=a.lease, attrs=rt.attrs(a))]).results[0]
+        self.assertEqual((res.total_len, len(res.mut_slots)), (16, 9))
+        res = svc.acquire([AcquireReq(end=12, lease=a.lease, attrs=rt.attrs(a))]).results[0]
+        self.assertEqual((res.total_len, len(res.mut_slots)), (16, 0))
+        self.assertEqual((lease.total_len, len(lease.pages)), (16, 4))
+
+    def test_memory_cut_honors_cut_align(self):
+        svc, rt = make(page_size=4, device_pages=7, with_host=False)
+        key = CacheKey(token_ids=list(range(1, 40)))
+        res = svc.acquire(
+            [AcquireReq(end=40, key=key, min_mut_len=1, cut_align=8, attrs=LeaseAttrs(prompt_len=40))]
+        ).results[0]
+        # 7 pages hold 28 tokens; the cut lands on the 8-token grid.
+        self.assertEqual(res.total_len, 24)
+
     def test_spec_rollback_frees_rejected_tail(self):
         svc, rt = make(page_size=2, device_pages=32, with_host=False)
         a = FakeReq(1, list(range(1, 8)), max_new=50)

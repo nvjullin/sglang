@@ -20,7 +20,9 @@ case_args() {
     device_only)
              echo "--num-prefixes 8 --prefix-len 1500 --rounds 3 -- --model-path $MODEL $DET --max-total-tokens 8192 --page-size 16" ;;
     eagle3)  echo "--num-prefixes 8 --prefix-len 1500 --rounds 3 --max-new-tokens 64 -- --model-path Qwen/Qwen3-8B --speculative-algorithm EAGLE3 --speculative-draft-model-path ${EAGLE_DRAFT:?set EAGLE_DRAFT} --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 $HI $DET --max-total-tokens 12288 --page-size 16" ;;
-    tp2dp2)  echo "--num-prefixes 8 --prefix-len 1500 --rounds 3 --max-new-tokens 64 -- --model-path $MODEL $HI $DET --max-total-tokens 8192 --page-size 16 --tp 2 --dp 2 --enable-dp-attention" ;;
+    mla)     echo "--num-prefixes 8 --prefix-len 1500 --rounds 3 --max-new-tokens 64 -- --model-path ${MLA_MODEL:?set MLA_MODEL} --trust-remote-code $HI $DET --max-total-tokens 8192 --page-size 16" ;;
+    dsa)     echo "--num-prefixes 6 --prefix-len 3000 --rounds 3 --max-new-tokens 32 --prompts-per-round 24 -- --model-path ${DSA_MODEL:?set DSA_MODEL} --trust-remote-code --load-format dummy --json-model-override-args {\"num_hidden_layers\":4,\"first_k_dense_replace\":1,\"n_routed_experts\":16,\"num_nextn_predict_layers\":0} $HI --max-total-tokens 16384 --page-size 64" ;;
+    tp2dp2)  echo "--num-prefixes 8 --prefix-len 1500 --rounds 3 --max-new-tokens 64 -- --model-path $MODEL $HI $DET --max-total-tokens 8192 --page-size 16 --tp 2 --attn-dp-size 2" ;;
     tp2)     echo "--num-prefixes 8 --prefix-len 1500 --rounds 3 --max-new-tokens 128 -- --model-path $MODEL $HI $DET --max-total-tokens 8192 --page-size 16 --chunked-prefill-size 2048 --tp 2" ;;
     *) echo "unknown case $1" >&2; exit 2 ;;
   esac
@@ -38,12 +40,12 @@ run_case() {  # name gpu_a gpu_b port_a port_b
 
 mkdir -p "$ROOT"
 if [ $# -eq 1 ] && [[ $1 == tp2* ]]; then
-  run_case "$1" 0,1 2,3 30000 30001 &
+  run_case "$1" 0,1 2,3 30000 30500 &
   P1=$!
 else
-  run_case "$1" 0 1 30000 30001 &
+  run_case "$1" 0 1 30000 30500 &
   P1=$!
-  if [ $# -ge 2 ]; then run_case "$2" 2 3 30002 30003 & P2=$!; fi
+  if [ $# -ge 2 ]; then run_case "$2" 2 3 31000 31500 & P2=$!; fi
 fi
 wait $P1; [ -n "${P2:-}" ] && wait $P2
 for n in "$@"; do

@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import logging
 from functools import partial
-from typing import Any, Optional, Sequence
+from typing import Any, Callable, Optional, Sequence
+
+import msgspec
 
 import torch
 
@@ -49,20 +51,27 @@ class ServiceLayerCounter(LayerDoneCounter):
         return self.producer_index
 
 
-class _HostMirror:
-    """A device pool and the host pool holding its pages at the same ids."""
+class HostMirror(msgspec.Struct, frozen=True):
+    """A device pool and the host pool that holds its pages at the same ids.
 
-    __slots__ = ("device_pool", "host_pool", "staged_write")
+    ``layer_mapper`` maps a transfer layer to the host pool's layer (None:
+    identity); ``packed_draft_pools`` are one-layer draft pools whose layers the
+    host pool stores after the target's (NextN MTP).
+    """
 
-    def __init__(self, device_pool: Any, host_pool: Any, io_backend: str):
-        self.device_pool = device_pool
-        self.host_pool = host_pool
-        # The staged write-back kernel takes CPU host ids; the others GPU ids.
-        self.staged_write = (
-            io_backend == "kernel"
-            and host_pool.layout in ("page_first", "page_unified")
-            and host_pool.can_use_write_back_jit
-        )
+    device_pool: Any
+    host_pool: Any
+    layer_mapper: Optional[Callable[[int], Optional[int]]] = None
+    packed_draft_pools: tuple = ()
+
+
+def _staged_write(host_pool: Any, io_backend: str) -> bool:
+    # The staged write-back kernel takes CPU host ids; the others GPU ids.
+    return (
+        io_backend == "kernel"
+        and host_pool.layout in ("page_first", "page_unified")
+        and host_pool.can_use_write_back_jit
+    )
 
 
 def _packed_draft_layer(layer_id: int, *, expected: int, host_layer: int) -> Optional[int]:
@@ -70,40 +79,31 @@ def _packed_draft_layer(layer_id: int, *, expected: int, host_layer: int) -> Opt
 
 
 class GpuDataPlane(DataPlane):
-    """``packed_draft_pools`` are draft layers stored in the target host pool
-    (NextN MTP); ``sidecars`` are (draft device pool, its own host pool) pairs
-    whose ids follow the target's (EAGLE draft models)."""
+    """Copies for every host mirror at once; all mirrors share page ids. The
+    first mirror is the target KV pool, whose layer count paces loads."""
 
     def __init__(
         self,
         *,
-        kv_pool: Any,
-        host_pool: Any,
+        mirrors: Sequence[HostMirror],
         page_size: int,
         io_backend: str,
         device: torch.device,
-        packed_draft_pools: Sequence[Any] = (),
-        sidecars: Sequence[tuple[Any, Any]] = (),
     ):
         self.page_size = page_size
-        self.kv_pool = kv_pool
-        self.host_pool = host_pool
         self.io_backend = io_backend
         self.device = device
-        self._mirrors = [_HostMirror(kv_pool, host_pool, io_backend)] + [
-            _HostMirror(d, h, io_backend) for d, h in sidecars
-        ]
+        self._mirrors = tuple(mirrors)
         for m in self._mirrors:
             assert m.host_pool.logical_page_size == page_size
         self.host_num_pages = min(
             m.host_pool.logical_size // page_size for m in self._mirrors
         )
-        self._packed_draft_pools = tuple(packed_draft_pools)
         self._host = PageAllocator(num_pages=self.host_num_pages)
         self.engine = L2TransferEngine(io_backend)
         self.side_stream = torch.cuda.Stream(device=device)
-        self.counter = ServiceLayerCounter(kv_pool.layer_num)
-        self._layer_count = kv_pool.layer_num
+        self._layer_count = self._mirrors[0].device_pool.layer_num
+        self.counter = ServiceLayerCounter(self._layer_count)
         self._queued: list[tuple[list[int], list[int], _GpuOp]] = []
 
     def _slots(self, pages: Sequence[int], *, on_device: bool) -> torch.Tensor:
@@ -120,34 +120,41 @@ class GpuDataPlane(DataPlane):
         device_ids = self._slots(device_pages, on_device=True)
         host_gpu = self._slots(host_pages, on_device=True)
         host_cpu = self._slots(host_pages, on_device=False)
-        transfers = [
-            L2Transfer(
-                host_pool=m.host_pool,
-                device_pool=m.device_pool,
-                host_indices=host_cpu if write and m.staged_write else host_gpu,
-                device_indices=device_ids,
+        transfers = []
+        for m in self._mirrors:
+            staged = write and _staged_write(m.host_pool, self.io_backend)
+            transfers.append(
+                L2Transfer(
+                    host_pool=m.host_pool,
+                    device_pool=m.device_pool,
+                    host_indices=host_cpu if staged else host_gpu,
+                    device_indices=device_ids,
+                    layer_mapper=m.layer_mapper,
+                )
             )
-            for m in self._mirrors
-        ]
-        if not write:
-            # A whole-layer backup already covers packed draft layers.
-            target_layers = self._layer_count
-            for depth, pool in enumerate(self._packed_draft_pools):
+            if write:
+                # A whole-layer backup already covers packed draft layers.
+                continue
+            for depth, pool in enumerate(m.packed_draft_pools):
                 transfers.append(
                     L2Transfer(
-                        host_pool=self.host_pool,
+                        host_pool=m.host_pool,
                         device_pool=pool,
                         host_indices=host_gpu,
                         device_indices=device_ids,
                         layer_mapper=partial(
                             _packed_draft_layer,
-                            expected=min(depth, target_layers - 1),
-                            host_layer=target_layers + depth,
+                            expected=min(depth, self._layer_count - 1),
+                            host_layer=self._host_layer(m, self._layer_count + depth),
                         ),
                         is_draft=True,
                     )
                 )
         return transfers
+
+    @staticmethod
+    def _host_layer(m: HostMirror, transfer_layer: int) -> int:
+        return transfer_layer if m.layer_mapper is None else m.layer_mapper(transfer_layer)
 
     def host_num_pages_free(self) -> int:
         return self._host.num_free

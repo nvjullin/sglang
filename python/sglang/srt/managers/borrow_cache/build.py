@@ -12,9 +12,16 @@ from sglang.srt.managers.borrow_cache.facade import BorrowTreeFacade
 from sglang.srt.managers.scheduler_components.new_token_ratio_tracker import (
     NewTokenRatioTracker,
 )
+from sglang.srt.mem_cache.borrow.hicache.gpu_data_plane import GpuDataPlane, HostMirror
 from sglang.srt.mem_cache.borrow.hicache.service import HiCacheService, ServiceConfig
+from sglang.srt.mem_cache.hybrid_cache.host_pool_config import prepare_host_pool_config
+from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
+    build_host_pool_group,
+    build_kv_host_pool,
+)
 from sglang.srt.mem_cache.borrow.threaded import ThreadedService
 from sglang.srt.mem_cache.memory_pool import (
+    DSATokenToKVPool,
     MHATokenToKVPool,
     MLATokenToKVPool,
     ReqToTokenPool,
@@ -35,8 +42,8 @@ def _unsupported(
 ) -> list[str]:
     memory, parallel = get_memory(), get_parallel()
     checks = {
-        "KV pools other than full-attention MHA/MLA": type(allocator.get_kvcache())
-        not in (MHATokenToKVPool, MLATokenToKVPool),
+        "KV pools other than full-attention MHA/MLA/DSA": type(allocator.get_kvcache())
+        not in (MHATokenToKVPool, MLATokenToKVPool, DSATokenToKVPool),
         "recurrent state (Mamba / linear attention)": allocator.state is not None,
         "request tables other than ReqToTokenPool": type(req_to_token_pool)
         is not ReqToTokenPool,
@@ -62,6 +69,37 @@ def _unsupported(
         == HiCacheDraftMode.FUSED,
     }
     return [name for name, bad in checks.items() if bad]
+
+
+def _host_mirrors(
+    *, kv_pool: Any, page_size: int, packed: tuple, sidecar_pools: tuple
+) -> list[HostMirror]:
+    """Host pools for the device KV, built as the HiCache host stack builds them
+    (target KV plus its sidecar buffers such as a DSA indexer), and one host
+    pool per EAGLE draft pool, all over the same page ids."""
+    layers = kv_pool.layer_num
+    group = build_host_pool_group(
+        config=prepare_host_pool_config(
+            root=kv_pool,
+            full_layer_mapping={i: i for i in range(layers)},
+            transfer_layer_id_max=layers,
+            transfer_page_size=page_size,
+            packed_draft_device_pools=packed,
+        )
+    )
+    mirrors = [
+        HostMirror(
+            device_pool=e.device_pool,
+            host_pool=e.host_pool,
+            layer_mapper=e.layer_mapper,
+            packed_draft_pools=tuple(e.packed_draft_device_pools),
+        )
+        for e in group.entries
+    ]
+    for pool in sidecar_pools:
+        host = build_kv_host_pool(kv_pool=pool, page_size=page_size, pool_label="draft")
+        mirrors.append(HostMirror(device_pool=pool, host_pool=host))
+    return mirrors
 
 
 def build_borrow_tree_facade(
@@ -93,19 +131,12 @@ def build_borrow_tree_facade(
     sidecar_pools = tuple(
         draft_plan.device_pools if draft_plan.mode == HiCacheDraftMode.SIDECAR else ()
     )
-    host_pool, sidecars = None, ()
-    if enable_hierarchical_cache:
-        from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
-            build_kv_host_pool,
-        )
-
-        host_pool = build_kv_host_pool(
-            kv_pool=kv_pool, page_size=page_size, mtp_draft_device_pools=packed
-        )
-        sidecars = tuple(
-            (pool, build_kv_host_pool(kv_pool=pool, page_size=page_size, pool_label="draft"))
-            for pool in sidecar_pools
-        )
+    mirrors = _host_mirrors(
+        kv_pool=kv_pool,
+        page_size=page_size,
+        packed=packed,
+        sidecar_pools=sidecar_pools,
+    ) if enable_hierarchical_cache else None
     ratio = NewTokenRatioTracker.from_config()
     config = ServiceConfig(
         page_size=page_size,
@@ -121,19 +152,9 @@ def build_borrow_tree_facade(
 
     def make_service() -> HiCacheService:
         data_plane = None
-        if host_pool is not None:
-            from sglang.srt.mem_cache.borrow.hicache.gpu_data_plane import (
-                GpuDataPlane,
-            )
-
+        if mirrors is not None:
             data_plane = GpuDataPlane(
-                kv_pool=kv_pool,
-                host_pool=host_pool,
-                page_size=page_size,
-                io_backend=io_backend,
-                device=device,
-                packed_draft_pools=packed,
-                sidecars=sidecars,
+                mirrors=mirrors, page_size=page_size, io_backend=io_backend, device=device
             )
         return HiCacheService(config=config, data_plane=data_plane)
 
@@ -146,7 +167,7 @@ def build_borrow_tree_facade(
         "Decoupled HiCache service started: %d device pages of %d tokens, host tier %s",
         config.num_device_pages,
         page_size,
-        "on" if host_pool is not None else "off",
+        "on" if mirrors is not None else "off",
     )
     return BorrowTreeFacade(
         client=BorrowCacheClient(service=service, page_size=page_size),

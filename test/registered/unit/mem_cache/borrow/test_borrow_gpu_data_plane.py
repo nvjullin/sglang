@@ -9,7 +9,7 @@ import unittest
 
 import torch
 
-from sglang.srt.mem_cache.borrow.hicache.gpu_data_plane import GpuDataPlane
+from sglang.srt.mem_cache.borrow.hicache.gpu_data_plane import GpuDataPlane, HostMirror
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 
@@ -44,8 +44,7 @@ class TestGpuDataPlane(unittest.TestCase):
             write_back_staging=kv.hicache_write_back_staging,
         )
         dp = GpuDataPlane(
-            kv_pool=kv,
-            host_pool=host,
+            mirrors=[HostMirror(device_pool=kv, host_pool=host)],
             page_size=ps,
             io_backend="kernel",
             device=torch.device("cuda"),

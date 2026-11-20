@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Callable, Optional
 
+import msgspec
 import torch
 
 from sglang.srt.managers.borrow_cache.client import BorrowCacheClient
@@ -28,7 +29,9 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
     build_kv_host_pool,
     build_mamba_host_pool,
 )
+from sglang.srt.mem_cache.borrow.hicache.windows import WindowConfig
 from sglang.srt.mem_cache.borrow.threaded import ThreadedService
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.kv_cache_configurator import host_only_mamba_checkpoint
 from sglang.srt.mem_cache.memory_pool import (
     DSATokenToKVPool,
@@ -73,6 +76,8 @@ def _unsupported(
         and type(allocator) is not SWATokenToKVPoolAllocator,
         "sliding-window bounded replay": get_exec().features.enable_decoder_swa_bounded_replay
         or get_exec().features.enable_encoder_swa_bounded_replay,
+        "speculative decoding with a sliding-window pool": isinstance(kv_pool, SWAKVPool)
+        and not spec_algorithm.is_none(),
         "request tables other than ReqToTokenPool (HybridReqToTokenPool with "
         "recurrent state)": type(req_to_token_pool) is not table,
         "pipeline parallelism": parallel.pp_size > 1,
@@ -162,9 +167,8 @@ def _full_kv_pool(kv_pool: Any) -> Any:
 
 
 def _swa_mirrors(*, kv_pool: SWAKVPool, page_size: int) -> list[HostMirror]:
-    """Host pools for the full and the sliding-window pool. The service pairs
-    full page p with window page p (see `_pool_table_binder`), so both mirrors
-    share page ids."""
+    """Host pools for the full and the sliding-window pool; the window pool's
+    pages are their own id space."""
     start = kv_pool.start_layer
     _, transfer_layer_id_max = _kv_transfer_layers(kv_pool)
     mirrors = []
@@ -182,27 +186,28 @@ def _swa_mirrors(*, kv_pool: SWAKVPool, page_size: int) -> list[HostMirror]:
                 device_pool=pool,
                 host_pool=build_kv_host_pool(kv_pool=pool, page_size=page_size, pool_label=label),
                 layer_mapper=_make_layer_mapper(mapping, transfer_layer_id_max),
+                space="window" if is_swa else "kv",
             )
         )
     return mirrors
 
 
+def _window_config(allocator: Any, *, page_size: int, window: int) -> WindowConfig:
+    return WindowConfig(
+        num_pages=allocator.size_swa // page_size,
+        window_tokens=window,
+        retire_interval=max(1, envs.SGLANG_SWA_EVICTION_INTERVAL.get()),
+    )
+
+
 def _pool_table_binder(allocator: Any, *, page_size: int) -> Callable[[], None]:
     """Scheduler-side table setup the service relies on; re-run after a pool clear.
 
-    - A sliding-window pair gets an identity full -> window slot mapping over the
-      pages the service hands out (it pairs full page p with window page p), so
-      no request ever writes the mapping; windows are not retired.
-    - The scheduler's own state slot allocator is drained: the service owns
-      every state slot, so a stray allocation fails instead of aliasing one.
+    The scheduler's own state slot allocator is drained: the service owns every
+    state slot, so a stray allocation fails instead of aliasing one.
     """
 
     def bind() -> None:
-        if isinstance(allocator, SWATokenToKVPoolAllocator):
-            # allocator.size is min(full, window) tokens; page 0 is padding.
-            n = allocator.size + page_size
-            mapping = allocator.full_to_swa_index_mapping
-            mapping[:n] = torch.arange(n, dtype=mapping.dtype, device=mapping.device)
         if allocator.state is not None:
             slots = allocator.state.slots
             if slots.available_size():
@@ -268,6 +273,7 @@ def build_borrow_tree_facade(
     enable_hierarchical_cache: bool,
     spec_algorithm: Any,
     draft_plan: Optional[HiCacheDraftPlan],
+    swa_retain_window: Optional[int],
 ) -> BorrowTreeFacade:
     kv_pool = token_to_kv_pool_allocator.get_kvcache()
     draft_plan = draft_plan or HiCacheDraftPlan()
@@ -304,7 +310,17 @@ def build_borrow_tree_facade(
         state=None
         if state is None
         else _state_config(state, req_to_token_pool=req_to_token_pool, page_size=page_size),
+        window=None
+        if not isinstance(kv_pool, SWAKVPool)
+        else _window_config(
+            token_to_kv_pool_allocator, page_size=page_size, window=swa_retain_window
+        ),
     )
+    if isinstance(kv_pool, SWAKVPool):
+        # Full pages are no longer capped by the window pool.
+        config = msgspec.structs.replace(
+            config, num_device_pages=token_to_kv_pool_allocator.size_full // page_size
+        )
     device = torch.device(_full_kv_pool(kv_pool).device)
     if device.type == "cuda" and device.index is None:
         device = torch.device("cuda", torch.cuda.current_device())
@@ -353,7 +369,13 @@ def build_borrow_tree_facade(
         "on" if mirrors is not None else "off",
     )
     return BorrowTreeFacade(
-        client=BorrowCacheClient(service=service, page_size=page_size),
+        client=BorrowCacheClient(
+            service=service,
+            page_size=page_size,
+            window=None
+            if config.window is None
+            else (config.window.window_tokens, config.window.retire_interval),
+        ),
         req_to_token_pool=req_to_token_pool,
         token_to_kv_pool_allocator=token_to_kv_pool_allocator,
         page_size=page_size,

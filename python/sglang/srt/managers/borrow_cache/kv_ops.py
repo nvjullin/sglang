@@ -52,10 +52,15 @@ def alloc_for_extend(batch: ScheduleBatch):
         raise RuntimeError(
             "alloc_for_extend: no free request rows; lower --max-running-requests"
         )
-    prefix_tensors, mut_slots = [], []
+    prefix_tensors, mut_slots, window_pairs = [], [], []
     for req, held, row in zip(batch.reqs, holds_row, rows):
         prefix, mut = client.take_pending(req)
         assert len(mut) == req.extend_len, (req.rid, len(mut), req.extend_len)
+        if client.window is not None:
+            prefix_w, mut_w = client.take_pending_windows(req)
+            window_pairs.append((mut, mut_w))
+            if prefix_w is not None:
+                window_pairs.append((prefix, prefix_w))
         if held:
             assert prefix is None
             prefix_tensors.append(req_to_token[row, : req.prefix_len].to(torch.int64))
@@ -64,6 +69,8 @@ def alloc_for_extend(batch: ScheduleBatch):
             prefix_tensors.append(_to_device(prefix, device, pin))
         mut_slots.append(mut)
     out_cache_loc = _to_device(torch.cat(mut_slots), device, pin)
+    if window_pairs:
+        _write_window_map(batch.token_to_kv_pool_allocator, window_pairs, device, pin)
 
     rows_cpu = torch.tensor(rows, dtype=torch.int64, pin_memory=pin)
     prefix_lens_cpu = torch.tensor(batch.prefix_lens, dtype=torch.int64, pin_memory=pin)
@@ -91,14 +98,17 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
     """Write the slots `grow_running_batch` was granted for this step."""
     assert token_per_req == 1, "multi-token decode steps go through spec decoding"
     client = batch.tree_cache.client
-    slots = []
+    pin = is_pin_memory_available(batch.device)
+    slots, window_pairs = [], []
     for req in batch.reqs:
         prefix, mut = client.take_pending(req)
         assert prefix is None and len(mut) == 1, (req.rid, len(mut))
         slots.append(mut)
-    out_cache_loc = _to_device(
-        torch.cat(slots), batch.device, is_pin_memory_available(batch.device)
-    )
+        if client.window is not None:
+            window_pairs.append((mut, client.take_pending_windows(req)[1]))
+    out_cache_loc = _to_device(torch.cat(slots), batch.device, pin)
+    if window_pairs:
+        _write_window_map(batch.token_to_kv_pool_allocator, window_pairs, batch.device, pin)
     batch.req_to_token_pool.write(
         (batch.req_pool_indices, batch.seq_lens), out_cache_loc.to(torch.int32)
     )
@@ -107,10 +117,49 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
     return out_cache_loc
 
 
+def _write_window_map(allocator, pairs, device, pin: bool) -> None:
+    """Point each borrowed KV slot at its window slot in the allocator's
+    full -> window table. Zero window ids (a shared position outside this
+    request's window) are skipped: another request sharing the page may
+    still read its entry."""
+    full = torch.cat([f for f, _ in pairs])
+    window = torch.cat([w for _, w in pairs])
+    keep = window != 0
+    full, window = full[keep], window[keep]
+    if full.numel() == 0:
+        return
+    mapping = allocator.full_to_swa_index_mapping
+    mapping[_to_device(full, device, pin)] = _to_device(window, device, pin)
+
+
+def _window_release_point(frontier: int, *, window: int, page_size: int) -> int:
+    """Positions below this are out of every later forward's window."""
+    keep = -(-max(window, page_size) // page_size) * page_size
+    return max(0, frontier - keep) // page_size * page_size
+
+
+def retire_windows_for_decode(batch: ScheduleBatch) -> None:
+    """The scheduler's window retirement rule (``ScheduleBatch.maybe_evict_swa``)
+    as window releases: every ``interval`` positions past the window, once the
+    request's prefill forward is no longer in flight."""
+    client = batch.tree_cache.client
+    window, interval = client.window
+    ps = client.page_size
+    for req in batch.reqs:
+        frontier = req.seqlen - 1
+        if req.decode_batch_idx < 1 or frontier - window < client.window_floor(req) + interval:
+            continue
+        client.release_window(
+            req, below=_window_release_point(frontier, window=window, page_size=ps)
+        )
+
+
 def grow_running_batch(batch: ScheduleBatch, token_per_req: int) -> list[Req]:
     """Borrow the next decode step's positions; returns the requests the cache
     revoked, which the caller must retract."""
     client = batch.tree_cache.client
+    if client.window is not None:
+        retire_windows_for_decode(batch)
     if batch.spec_algorithm.is_none():
         ends = (batch.seq_lens_cpu + token_per_req).tolist()
     else:
@@ -213,10 +262,19 @@ def _state_anchor(req: Req, published_len: int) -> Optional[StateAnchor]:
 
 def checkpoint_kv_cache(req: Req, tree_cache: BorrowTreeFacade) -> None:
     """Publish what a running request computed so far (a chunk end)."""
+    client = tree_cache.client
     if not req.skip_radix_cache_insert:
         token_ids = req.full_untruncated_fill_ids[: req.extend_end]
-        tree_cache.client.publish(
-            req, token_ids, state=_state_anchor(req, len(token_ids))
+        client.publish(req, token_ids, state=_state_anchor(req, len(token_ids)))
+    if client.window is not None:
+        # As the old tree's checkpoint does: the next extend starts at
+        # extend_end and reads one window back.
+        window, _ = client.window
+        client.release_window(
+            req,
+            below=_window_release_point(
+                req.extend_end - 1, window=window, page_size=client.page_size
+            ),
         )
     req.prefix_len = req.extend_end
 

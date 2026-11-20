@@ -552,6 +552,49 @@ class TestSlidingWindow(unittest.TestCase):
         rt.forward([c])
         check_window_accounting(svc)
 
+    def test_recomputed_prefix_recovers_tombstoned_windows(self):
+        """A request that recomputes a cached prefix whose window is gone
+        publishes its live window pages in place of the tombstones (the
+        unborrowed cached pages are swapped for its own), so the next request
+        with that prefix shares it."""
+        svc, rt = make_window(page_size=4, window=8)
+        a = FakeReq(1, list(range(1, 42)), max_new=0)
+        self._run(rt, a)
+        rt.retire_windows(a)
+        rt.finish(a)
+        b = FakeReq(2, a.prompt[:24] + [99] * 5, max_new=0)
+        self._run(rt, b)
+        self.assertEqual(svc.counters["device_hit_tokens"], 0)
+        rt.finish(b)
+        self.assertGreater(svc.counters["windows_recovered"], 0)
+        c = FakeReq(3, a.prompt[:24] + [55] * 5, max_new=0)
+        self.assertTrue(rt.open(c))
+        self.assertEqual(c.computed, 24)
+        rt.forward([c])
+        check_accounting(svc)
+        check_window_accounting(svc)
+
+    def test_window_eviction_keeps_trailing_windows_longest(self):
+        """Under window pressure every node's interior window pages go before
+        any node's trailing window, so an older prefix stays shareable while
+        newer interior windows are tombstoned."""
+        svc, rt = make_window(page_size=4, device_pages=64, window_pages=24, window=8)
+        a = FakeReq(1, list(range(1, 26)), max_new=0)
+        self._run(rt, a)
+        rt.finish(a)
+        b = FakeReq(2, list(range(100, 141)), max_new=0)
+        self._run(rt, b)
+        rt.finish(b)
+        # 13 window pages against 8 free: 5 cached ones are tombstoned.
+        c = FakeReq(3, list(range(200, 249)), max_new=0)
+        self._run(rt, c)
+        rt.finish(c, publish=False)
+        hit = FakeReq(4, a.prompt[:24] + [9], max_new=0)
+        self.assertTrue(rt.open(hit))
+        self.assertEqual(hit.computed, 24)
+        rt.forward([hit])
+        check_window_accounting(svc)
+
     def test_released_windows_admit_more_leases(self):
         """Window pages, not KV pages, bound admission here; releasing them
         behind the window lets the next lease in."""

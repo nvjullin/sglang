@@ -159,6 +159,7 @@ class HiCacheService(KVCacheService):
             state_host_loads=0,
             states_published=0,
             states_backed_up=0,
+            windows_recovered=0,
         )
 
     # ===== Helpers =====
@@ -552,7 +553,12 @@ class HiCacheService(KVCacheService):
         end = self._grant_end(r, lease.total_len, room)
         if end is None:
             self.counters["refused"] += 1
-            return AcquireResult(status=AcquireStatus.REFUSED, lease=lease.id)
+            return AcquireResult(
+                status=AcquireStatus.REFUSED,
+                lease=lease.id,
+                shared_len=lease.shared_len,
+                total_len=lease.total_len,
+            )
         pages, windows = self._take_pair(self._grow_pages(lease, end))
         return self._extend(lease, end, pages, windows)
 
@@ -639,6 +645,9 @@ class HiCacheService(KVCacheService):
                 lease.private[i] = False
         if self.win is not None:
             self.win.adopt(lease, out.adopted)
+            if out.replaced:
+                self.device.free(out.replaced)
+                self.counters["windows_recovered"] += len(out.replaced)
         self.index.lock(out.last_node)
         self.index.unlock(lease.node)
         lease.node = out.last_node

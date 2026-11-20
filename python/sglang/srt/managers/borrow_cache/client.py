@@ -35,13 +35,22 @@ logger = logging.getLogger(__name__)
 class LeaseView:
     """What the scheduler keeps of one lease."""
 
-    __slots__ = ("lease", "prefix_slots", "pending_slots", "pending_state")
+    __slots__ = (
+        "lease",
+        "prefix_slots",
+        "pending_slots",
+        "pending_state",
+        "prefix_window_slots",
+        "pending_window_slots",
+        "window_floor",
+    )
 
     def __init__(
         self,
         lease: int,
         prefix_slots: Optional[torch.Tensor],
         state: Optional[StateGrant],
+        prefix_window_slots: Optional[torch.Tensor] = None,
     ):
         self.lease = lease
         # Slot ids of the shared prefix, until written into the request's row.
@@ -50,12 +59,25 @@ class LeaseView:
         self.pending_slots: list[torch.Tensor] = []
         # Recurrent-state slots, until bound to the request.
         self.pending_state = state
+        # Window slot ids aligned with the pending KV slot ids (0: none).
+        self.prefix_window_slots = prefix_window_slots
+        self.pending_window_slots: list[torch.Tensor] = []
+        # Window borrows below this position are released.
+        self.window_floor = 0
 
 
 class BorrowCacheClient:
-    def __init__(self, *, service: KVCacheService, page_size: int):
+    def __init__(
+        self,
+        *,
+        service: KVCacheService,
+        page_size: int,
+        window: Optional[tuple[int, int]] = None,
+    ):
         self.service = service
         self.page_size = page_size
+        # (window tokens, retirement interval) when KV has a window pool.
+        self.window = window
         self._views: dict[str, LeaseView] = {}
         self._batch_id = 0
         # Arbitrary; often enough to follow a test run in the server log.
@@ -109,8 +131,12 @@ class BorrowCacheClient:
             )
         )
         if res.status == AcquireStatus.GRANTED:
-            view = LeaseView(res.lease, res.shared_slots, res.state)
+            view = LeaseView(
+                res.lease, res.shared_slots, res.state, res.shared_window_slots
+            )
             view.pending_slots.append(res.mut_slots)
+            if self.window is not None:
+                view.pending_window_slots.append(res.mut_window_slots)
             self._views[req.rid] = view
             if res.state is not None:
                 req.mamba_branching_seqlen = res.state.branch_len
@@ -138,6 +164,8 @@ class BorrowCacheClient:
         )
         if res.status == AcquireStatus.GRANTED:
             view.pending_slots.append(res.mut_slots)
+            if self.window is not None:
+                view.pending_window_slots.append(res.mut_window_slots)
         return res
 
     def grow(self, reqs: Sequence[Req], ends: Sequence[int]) -> list[Req]:
@@ -156,8 +184,18 @@ class BorrowCacheClient:
                 del self._views[req.rid]
                 revoked.append(req)
             else:
-                assert res.status == AcquireStatus.GRANTED, res
+                assert res.status == AcquireStatus.GRANTED, (
+                    res,
+                    req.rid,
+                    len(req.full_untruncated_fill_ids),
+                    len(req.origin_input_ids),
+                    len(req.output_ids),
+                    req.seqlen,
+                    req.retraction_count,
+                )
                 view.pending_slots.append(res.mut_slots)
+                if self.window is not None:
+                    view.pending_window_slots.append(res.mut_window_slots)
         self._check_events(batch.events, expected={v.lease for v in views})
         return revoked
 
@@ -180,6 +218,27 @@ class BorrowCacheClient:
         view.pending_slots = []
         mut = pending[0] if len(pending) == 1 else torch.cat(pending)
         return prefix, mut
+
+    def take_pending_windows(
+        self, req: Req
+    ) -> tuple[Optional[torch.Tensor], torch.Tensor]:
+        """Window slot ids aligned with what `take_pending` just returned."""
+        view = self._views[req.rid]
+        prefix, view.prefix_window_slots = view.prefix_window_slots, None
+        pending = view.pending_window_slots
+        view.pending_window_slots = []
+        mut = pending[0] if len(pending) == 1 else torch.cat(pending)
+        return prefix, mut
+
+    def release_window(self, req: Req, *, below: int) -> None:
+        """Drop the request's window borrows of positions < ``below``."""
+        view = self._views[req.rid]
+        if below > view.window_floor:
+            view.window_floor = below
+            self.service.release(view.lease, window_below=below, from_len=None)
+
+    def window_floor(self, req: Req) -> int:
+        return self._views[req.rid].window_floor
 
     def take_state(self, req: Req) -> Optional[StateGrant]:
         """The state slots granted with the lease, once, to bind to the request."""

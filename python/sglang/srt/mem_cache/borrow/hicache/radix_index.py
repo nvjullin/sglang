@@ -90,6 +90,9 @@ class InsertOutcome(msgspec.Struct):
     adopted: list
     # Nodes that became device-resident with the caller's pages.
     new_resident: list
+    # Cached device pages the caller's pages replaced (window recovery); the
+    # caller frees them.
+    replaced: list = []
 
 
 class PrefixIndex:
@@ -324,12 +327,15 @@ class PrefixIndex:
     ) -> InsertOutcome:
         """Cache ``tokens`` backed by ``pages`` (one per page of tokens) and,
         with a sliding window, ``window_pages`` (None entries: tombstones).
-        A node that takes the caller's pages takes their window pages too."""
+        A node that takes the caller's pages takes their window pages too, and
+        an unlocked cached page whose window is a tombstone is swapped for the
+        caller's page and its live window page (window recovery)."""
         ps = self.page_size
         assert len(tokens) % ps == 0 and len(pages) == len(tokens) // ps
         self.clock += 1
         adopted = [False] * len(pages)
         new_resident: list[Node] = []
+        replaced: list[int] = []
         node, pos = self.root, 0
         while pos < len(tokens):
             child = node.children.get(self._child_key(node, namespace, tokens, pos))
@@ -350,10 +356,48 @@ class PrefixIndex:
                 self._take_pages(
                     child, pages, window_pages, pos // ps, adopted, new_resident
                 )
+            elif window_pages is not None:
+                self._recover_windows(child, pages, window_pages, pos // ps, adopted, replaced)
             child.last_access = self.clock
             pos += common
             node = child
-        return InsertOutcome(last_node=node, adopted=adopted, new_resident=new_resident)
+        return InsertOutcome(
+            last_node=node, adopted=adopted, new_resident=new_resident, replaced=replaced
+        )
+
+    def _recover_windows(
+        self,
+        node: Node,
+        pages: Sequence[int],
+        window_pages: Sequence,
+        first: int,
+        adopted: list[bool],
+        replaced: list[int],
+    ) -> None:
+        """Swap tombstoned pages of an unborrowed cached node for the caller's
+        duplicate pages that still have window KV."""
+        if node.lock_ref or (node.h2d_op is not None and not node.h2d_op.launched):
+            return
+        windows = node.window_pages or [None] * len(node.device_pages)
+        swap = [
+            j
+            for j, (old, w) in enumerate(zip(node.device_pages, windows))
+            if w is None
+            and window_pages[first + j] is not None
+            and pages[first + j] != old
+        ]
+        if not swap:
+            return
+        if node.d2h_op is not None:
+            # The old pages may still be read by their backup.
+            node.d2h_op.wait()
+        device, windows = list(node.device_pages), list(windows)
+        for j in swap:
+            replaced.append(device[j])
+            device[j], windows[j] = pages[first + j], window_pages[first + j]
+            adopted[first + j] = True
+        node.device_pages = device
+        self._set_window_pages(node, windows)
 
     def _take_pages(
         self,
@@ -506,21 +550,28 @@ class PrefixIndex:
         # Only cached window pages are ever pinned.
         return self.window_pages_cached - len(self._window_pins)
 
-    def evict_windows(self, num: int) -> list[int]:
-        """Tombstone up to ``num`` unpinned device window pages, LRU nodes
-        first; the nodes keep their KV pages."""
+    def evict_windows(self, num: int, *, trailing_pages: int = 0) -> list[int]:
+        """Tombstone up to ``num`` unpinned device window pages; nodes keep
+        their KV pages. A node's last ``trailing_pages`` window pages are what
+        a hit ending at the node reads, so every node's other (interior) pages
+        go first, LRU nodes first within each pass."""
+        order = [n for _, _, n in sorted((n.last_access, n.id, n) for n in self._window_nodes)]
         out: list[int] = []
-        for _, _, node in sorted((n.last_access, n.id, n) for n in self._window_nodes):
-            if len(out) >= num:
-                break
-            kept = []
-            for w in node.window_pages:
-                if w is not None and w not in self._window_pins and len(out) < num:
-                    out.append(w)
-                    kept.append(None)
-                else:
-                    kept.append(w)
-            self._set_window_pages(node, kept)
+        for interior_only in (True, False):
+            for node in order:
+                if len(out) >= num:
+                    return out
+                pages = node.window_pages
+                if pages is None:
+                    continue
+                cut = len(pages) - trailing_pages if interior_only else len(pages)
+                kept = list(pages)
+                for j in range(max(0, cut)):
+                    w = kept[j]
+                    if w is not None and w not in self._window_pins and len(out) < num:
+                        out.append(w)
+                        kept[j] = None
+                self._set_window_pages(node, kept)
         return out
 
     def evict_host_windows(self, num: int) -> list[int]:

@@ -58,7 +58,8 @@ class WindowPages:
         """Allocate window pages, tombstoning unpinned cached ones if needed."""
         short = num - self.alloc.num_free
         if short > 0:
-            self.alloc.free(self.index.evict_windows(short))
+            trailing = -(-self.cfg.window_tokens // self.ps)
+            self.alloc.free(self.index.evict_windows(short, trailing_pages=trailing))
         return self.alloc.alloc(num)
 
     # ===== Shared prefixes =====

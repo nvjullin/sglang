@@ -48,11 +48,14 @@ class BorrowPrefillAdder(PrefillAdder):
             return AddReqResult.NO_TOKEN
         input_len = len(req.full_untruncated_fill_ids)
         chunking = self.rem_chunk_tokens is not None
+        # At most one request is mid-prefill: the one carried over from the last
+        # pass or one this pass already cut short (by budget or by memory).
+        chunked_exists = has_chunked_req or self.new_chunked_req is not None
         res = self.client.open(
             req,
             end=input_len,
             max_mut_len=self._chunk_budget(),
-            min_mut_len=self.page_size if chunking and not has_chunked_req else None,
+            min_mut_len=self.page_size if chunking and not chunked_exists else None,
             cut_align=truncation_align_size,
         )
         if res.status != AcquireStatus.GRANTED:
@@ -65,7 +68,7 @@ class BorrowPrefillAdder(PrefillAdder):
             and self.can_run_list
             and self.ceil_paged_tokens(extend_len) >= self.rem_input_tokens
         )
-        if (is_chunked and has_chunked_req) or over_input_cap:
+        if (is_chunked and chunked_exists) or over_input_cap:
             self.client.release(req, publish_token_ids=None)
             return AddReqResult.OTHER
         self._commit(req, res, is_chunked=is_chunked)

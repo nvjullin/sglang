@@ -514,6 +514,7 @@ def build_kv_cache(
             enable_hierarchical_cache=enable_hierarchical_cache,
             spec_algorithm=spec_algorithm,
             draft_plan=hicache_draft_plan,
+            swa_retain_window=params.swa_retain_window,
         )
         init_mm_embedding_cache(envs.SGLANG_VLM_CACHE_SIZE_MB.get() * 1024 * 1024)
         return KVCacheBuildResult(

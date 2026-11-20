@@ -19,10 +19,16 @@ class TransferOp(ABC):
 
 
 class DataPlane(ABC):
-    """Host tier storage plus device <-> host copies, all on service streams."""
+    """Host tier storage plus device <-> host copies, all on service streams.
+
+    With a sliding window, window pages live in their own device and host id
+    spaces; ``windows`` arguments carry them next to the KV pages.
+    """
 
     page_size: int
     host_num_pages: int
+    # 0 without window pools.
+    host_num_window_pages: int = 0
 
     @abstractmethod
     def host_num_pages_free(self) -> int: ...
@@ -33,17 +39,36 @@ class DataPlane(ABC):
     @abstractmethod
     def free_host(self, pages: Sequence[int]) -> None: ...
 
+    def host_window_pages_free(self) -> int:
+        raise NotImplementedError
+
+    def alloc_host_windows(self, num_pages: int) -> Optional[list[int]]:
+        raise NotImplementedError
+
+    def free_host_windows(self, pages: Sequence[int]) -> None:
+        raise NotImplementedError
+
     @abstractmethod
     def backup(
-        self, device_pages: Sequence[int], host_pages: Sequence[int], *, after: Any
+        self,
+        device_pages: Sequence[int],
+        host_pages: Sequence[int],
+        *,
+        after: Any,
+        windows: Optional[tuple] = None,
     ) -> TransferOp:
-        """Launch device -> host now, after the event ``after`` (may be None)."""
+        """Launch device -> host now, after the event ``after`` (may be None).
+        ``windows`` = (device window pages, host window pages)."""
 
     @abstractmethod
     def queue_load(
-        self, host_pages: Sequence[int], device_pages: Sequence[int]
+        self,
+        host_pages: Sequence[int],
+        device_pages: Sequence[int],
+        windows: Optional[tuple] = None,
     ) -> TransferOp:
-        """Queue host -> device; it launches with the next ``launch_loads``."""
+        """Queue host -> device; it launches with the next ``launch_loads``.
+        ``windows`` = (host window pages, device window pages)."""
 
     @abstractmethod
     def launch_loads(self, *, after: Any) -> Optional[Fence]:

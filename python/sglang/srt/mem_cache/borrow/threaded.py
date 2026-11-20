@@ -131,9 +131,10 @@ class ThreadedService(KVCacheService):
         self,
         lease: int,
         *,
-        from_len: int = 0,
+        from_len: Optional[int] = 0,
         publish_token_ids: Optional[Sequence[int]] = None,
         state: Optional[StateAnchor] = None,
+        window_below: Optional[int] = None,
     ) -> None:
         self._post(
             "release",
@@ -141,6 +142,7 @@ class ThreadedService(KVCacheService):
             from_len=from_len,
             publish_token_ids=publish_token_ids,
             state=state,
+            window_below=window_below,
         )
 
     def poll(self) -> list:

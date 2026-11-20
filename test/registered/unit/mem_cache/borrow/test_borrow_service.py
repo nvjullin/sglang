@@ -29,6 +29,7 @@ from sglang.srt.mem_cache.borrow.hicache.service import (
     ServiceConfig,
     StateConfig,
 )
+from sglang.srt.mem_cache.borrow.hicache.windows import WindowConfig
 from sglang.srt.mem_cache.borrow.threaded import CacheServiceError, ThreadedService
 
 
@@ -76,6 +77,57 @@ def make_state(
     )
     svc = HiCacheService(config=cfg, data_plane=dp, state_plane=sp)
     return svc, FakeRuntime(svc, kv, state=sp, checkpoint_grid=grid)
+
+
+def make_window(
+    page_size=4,
+    device_pages=32,
+    window_pages=16,
+    host_pages=64,
+    host_windows=32,
+    window=8,
+    with_host=True,
+):
+    kv = np.full((device_pages + 1) * page_size, -1, dtype=np.int64)
+    wkv = np.full((window_pages + 1) * page_size, -1, dtype=np.int64)
+    dp = (
+        FakeDataPlane(
+            page_size=page_size,
+            host_num_pages=host_pages,
+            device_kv=kv,
+            device_window_kv=wkv,
+            host_num_window_pages=host_windows,
+        )
+        if with_host
+        else None
+    )
+    cfg = ServiceConfig(
+        page_size=page_size,
+        num_device_pages=device_pages,
+        window=WindowConfig(num_pages=window_pages, window_tokens=window, retire_interval=4),
+    )
+    svc = HiCacheService(config=cfg, data_plane=dp)
+    rt = FakeRuntime(svc, kv, window_kv=wkv, window_tokens=window, page_size=page_size)
+    return svc, rt
+
+
+def check_window_accounting(svc: HiCacheService) -> None:
+    """Every window page is free, cached by the index, or private to one lease;
+    pins are exactly the leases' borrows of cached pages."""
+    index = svc.index
+    private, pinned = [], []
+    for l in svc.leases.values():
+        for w, own in zip(l.wpages, l.wprivate):
+            if w is not None:
+                (private if own else pinned).append(w)
+    cached = [w for n in index._window_nodes for w in index.live_windows(n.window_pages)]
+    assert len(private + cached) == len(set(private + cached)), "a window page has two owners"
+    assert svc.win.alloc.num_free + len(private) + len(cached) == svc.cfg.window.num_pages
+    assert set(pinned) <= set(cached), "a lease pins an uncached window page"
+    counts = {}
+    for w in pinned:
+        counts[w] = counts.get(w, 0) + 1
+    assert counts == index._window_pins
 
 
 def check_state_accounting(svc: HiCacheService) -> None:
@@ -319,7 +371,10 @@ class TestLockstep(unittest.TestCase):
                 prefill = [r for r in running if len(r.slots) < len(r.prompt)]
                 for r in prefill:
                     rt.grow_chunk(r, max_mut_len=8)
-                decoding = [r for r in running if len(r.slots) >= len(r.prompt)]
+                # A chunk granted just now runs its forward before any decode.
+                decoding = [
+                    r for r in running if r not in prefill and len(r.slots) >= len(r.prompt)
+                ]
                 if decoding:
                     alive = rt.decode(decoding)
                     running = [r for r in running if r in alive or r in prefill]
@@ -467,6 +522,128 @@ class TestRecurrentState(unittest.TestCase):
                 check_state_accounting(svc_rt[0])
         st = svc_rt[0].stats().counters
         self.assertGreater(st["state_host_loads"] + st["state_device_hits"], 0)
+
+
+class TestSlidingWindow(unittest.TestCase):
+    """Window KV lives in its own pages; a forward reads the window KV of the
+    window_tokens positions before it, so a shared prefix must end where that
+    trailing window is still cached."""
+
+    def _run(self, rt, req):
+        self.assertTrue(rt.open(req))
+        rt.forward([req])
+
+    def test_hit_needs_live_trailing_window(self):
+        """Windows released before the publish become tombstones: a prefix
+        ending inside them is not shared, one whose trailing window survives is."""
+        svc, rt = make_window(page_size=4, window=8)
+        a = FakeReq(1, list(range(1, 42)), max_new=0)
+        self._run(rt, a)
+        rt.retire_windows(a)
+        rt.finish(a)
+        b = FakeReq(2, a.prompt[:24] + [99] * 5, max_new=0)
+        self._run(rt, b)
+        self.assertEqual(b.computed, 29)
+        self.assertEqual(svc.counters["device_hit_tokens"], 0)
+        rt.finish(b, publish=False)
+        c = FakeReq(3, a.prompt[:40] + [7], max_new=0)
+        self.assertTrue(rt.open(c))
+        self.assertEqual(c.computed, 40)
+        rt.forward([c])
+        check_window_accounting(svc)
+
+    def test_released_windows_admit_more_leases(self):
+        """Window pages, not KV pages, bound admission here; releasing them
+        behind the window lets the next lease in."""
+        svc, rt = make_window(page_size=4, device_pages=64, window_pages=12, window=4)
+        a = FakeReq(1, list(range(1, 34)), max_new=0)
+        self._run(rt, a)
+        b = FakeReq(2, list(range(50, 70)), max_new=0)
+        self.assertFalse(rt.open(b))
+        rt.retire_windows(a)
+        self.assertTrue(rt.open(b))
+        rt.forward([b])
+        check_window_accounting(svc)
+
+    def test_window_round_trips_through_the_host_tier(self):
+        svc, rt = make_window(page_size=4, device_pages=14, window_pages=24, window=8)
+        a = FakeReq(1, list(range(1, 34)), max_new=0)
+        self._run(rt, a)
+        rt.finish(a)
+        for i in range(3):
+            other = FakeReq(10 + i, [60 + i] * 33, max_new=0)
+            self._run(rt, other)
+            rt.finish(other)
+        c = FakeReq(2, a.prompt[:32] + [5], max_new=0)
+        self.assertTrue(rt.open(c))
+        self.assertEqual(c.computed, 32)
+        self.assertGreater(svc.counters["loaded_tokens"], 0)
+        rt.forward([c])
+        check_window_accounting(svc)
+
+    def _workload(self, svc_rt, seed):
+        svc, rt = svc_rt
+        rng = random.Random(seed)
+        log, running = [], []
+        prefixes = [[rng.randrange(1, 9) for _ in range(rng.randrange(4, 24))] for _ in range(4)]
+        for step in range(300):
+            if rng.random() < 0.5 and len(running) < 6:
+                prompt = rng.choice(prefixes) + [rng.randrange(1, 9) for _ in range(rng.randrange(1, 12))]
+                r = FakeReq(step, prompt, max_new=rng.randrange(1, 16))
+                ok = rt.open(r, min_mut_len=1, max_mut_len=rng.choice([None, 8]))
+                log.append(("open", step, ok, r.slots[:], r.wslots[:]))
+                if ok:
+                    running.append(r)
+            if running:
+                rt.forward(running)
+                for r in running:
+                    if rng.random() < 0.3:
+                        rt.publish(r)
+                    if rng.random() < 0.5:
+                        rt.retire_windows(r)
+                done = [r for r in running if len(r.slots) >= len(r.prompt) and len(r.out) >= r.max_new]
+                for r in done:
+                    rt.finish(r, publish=rng.random() < 0.8)
+                    running.remove(r)
+                prefill = [r for r in running if len(r.slots) < len(r.prompt)]
+                for r in prefill:
+                    rt.grow_chunk(r, max_mut_len=8)
+                # A chunk granted just now runs its forward before any decode.
+                decoding = [
+                    r for r in running if r not in prefill and len(r.slots) >= len(r.prompt)
+                ]
+                if decoding:
+                    alive = rt.decode(decoding)
+                    running = [r for r in running if r in alive or r in prefill]
+                log.append(("step", step, [(r.rid, tuple(r.slots), tuple(r.wslots)) for r in running]))
+            check_accounting(svc)
+            check_exclusive_mut(svc)
+            check_window_accounting(svc)
+        return log, svc.stats()
+
+    def test_random_workloads_keep_window_kv_correct(self):
+        """Chunked prefill, decode, retirement, publishes, tombstoning,
+        evictions, loads and revocations: every forward reads correct window KV."""
+        for seed in range(6):
+            for ps in (1, 4):
+                self._workload(
+                    make_window(
+                        page_size=ps,
+                        device_pages=60 // ps + 8,
+                        window_pages=40 // ps + 6,
+                        host_pages=80 // ps,
+                        host_windows=40 // ps,
+                        window=4,
+                    ),
+                    seed=seed,
+                )
+
+    def test_replicas_fed_same_calls_agree(self):
+        log1, st1 = self._workload(make_window(page_size=2, device_pages=40, window_pages=26), seed=3)
+        log2, st2 = self._workload(make_window(page_size=2, device_pages=40, window_pages=26), seed=3)
+        self.assertEqual(log1, log2)
+        self.assertEqual(st1, st2)
+        self.assertGreater(st1.counters["loaded_tokens"], 0)
 
 
 class TestThreaded(unittest.TestCase):

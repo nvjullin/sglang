@@ -32,6 +32,7 @@ from sglang.srt.mem_cache.borrow.api import (
 from sglang.srt.mem_cache.borrow.hicache.page_allocator import PageAllocator
 from sglang.srt.mem_cache.borrow.hicache.radix_index import Node, PrefixIndex
 from sglang.srt.mem_cache.borrow.hicache.transfer import DataPlane, StatePlane
+from sglang.srt.mem_cache.borrow.hicache.windows import WindowConfig, WindowPages
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +61,7 @@ class ServiceConfig(msgspec.Struct, frozen=True):
     min_new_token_ratio: float = 0.1
     new_token_ratio_decay: float = 0.001
     state: Optional[StateConfig] = None
+    window: Optional[WindowConfig] = None
 
 
 class Lease:
@@ -75,6 +77,9 @@ class Lease:
         "state_slots",
         "branch_len",
         "adopted_len",
+        "wpages",
+        "wprivate",
+        "window_floor",
     )
 
     def __init__(self, *, id: int, namespace: tuple, node: Node, attrs: LeaseAttrs):
@@ -94,6 +99,12 @@ class Lease:
         self.branch_len: Optional[int] = None
         # States at lengths <= adopted_len are cached or were offered already.
         self.adopted_len = 0
+        # Window page per page of positions (None: no window borrow);
+        # wprivate[i] means the lease frees it, else it pins a cached page.
+        self.wpages: list[Optional[int]] = []
+        self.wprivate: list[bool] = []
+        # Pages below this index have no window borrow left.
+        self.window_floor = 0
 
     def decode_phase(self) -> bool:
         return self.total_len >= self.attrs.prompt_len
@@ -108,6 +119,9 @@ class HiCacheService(KVCacheService):
         state_plane: Optional[StatePlane] = None,
     ):
         assert (config.state is None) == (state_plane is None)
+        assert config.state is None or config.window is None, (
+            "recurrent state with a sliding window is not supported"
+        )
         if config.state is not None:
             assert config.state.checkpoint_grid % config.page_size == 0
         self.cfg = config
@@ -116,6 +130,11 @@ class HiCacheService(KVCacheService):
         self.device = PageAllocator(num_pages=config.num_device_pages, first_page=1)
         self.dp = data_plane
         self.sp = state_plane
+        self.win = (
+            None
+            if config.window is None
+            else WindowPages(config=config.window, index=self.index, page_size=self.ps)
+        )
         self.states = (
             None
             if config.state is None
@@ -168,6 +187,13 @@ class HiCacheService(KVCacheService):
     def _headroom(self, reserved: int) -> int:
         return self.device.num_free + self.index.evictable_device_pages - reserved
 
+    def _window_room(self, own_reserve: int = 0) -> int:
+        """Window pages grantable now, beyond what decoding leases may need."""
+        if self.win is None:
+            return 1 << 62
+        reserved = sum(self.win.reserve(l) for l in self.leases.values())
+        return self.win.headroom(reserved) - own_reserve
+
     def _take(self, num_pages: int) -> Optional[list[int]]:
         """Allocate device pages, evicting unborrowed cache if needed."""
         short = num_pages - self.device.num_free
@@ -177,7 +203,19 @@ class HiCacheService(KVCacheService):
             self.device.free(ev.pages)
             if ev.states:
                 self.states.free(ev.states)
+            if ev.windows:
+                self.win.alloc.free(ev.windows)
         return self.device.alloc(num_pages)
+
+    def _take_pair(self, num_pages: int) -> tuple[list[int], list[int]]:
+        """KV pages and (with a window pool) as many window pages."""
+        pages = self._take(num_pages)
+        assert pages is not None, "headroom check admitted an unallocatable span"
+        if self.win is None:
+            return pages, []
+        windows = self.win.take(num_pages)
+        assert windows is not None, "window headroom check admitted an unallocatable span"
+        return pages, windows
 
     def _take_host(self, num_pages: int) -> Optional[list[int]]:
         if num_pages > self.dp.host_num_pages:
@@ -189,7 +227,17 @@ class HiCacheService(KVCacheService):
             self.dp.free_host(ev.pages)
             if ev.states:
                 self.sp.free_host(ev.states)
+            if ev.windows:
+                self.dp.free_host_windows(ev.windows)
         return self.dp.alloc_host(num_pages)
+
+    def _take_host_windows(self, num: int) -> Optional[list[int]]:
+        if num > self.dp.host_num_window_pages:
+            return None
+        short = num - self.dp.host_window_pages_free()
+        if short > 0:
+            self.dp.free_host_windows(self.index.evict_host_windows(short))
+        return self.dp.alloc_host_windows(num)
 
     def _take_states(self, num: int, *, keep: Optional[Node]) -> Optional[list[int]]:
         """Allocate device state slots, evicting cached states (not ``keep``'s)."""
@@ -243,18 +291,25 @@ class HiCacheService(KVCacheService):
         self,
         lease: int,
         *,
-        from_len: int = 0,
+        from_len: Optional[int] = 0,
         publish_token_ids: Optional[Sequence[int]] = None,
         state: Optional[StateAnchor] = None,
+        window_below: Optional[int] = None,
     ) -> None:
         l = self.leases[lease]
         if publish_token_ids is not None:
-            self._publish(l, publish_token_ids, state=state, running=from_len > 0)
+            self._publish(l, publish_token_ids, state=state, running=from_len != 0)
+        if window_below is not None and self.win is not None:
+            self.win.release_below(l, window_below)
+        if from_len is None:
+            return
         if from_len == 0:
             self._end(l)
             return
         assert l.shared_len <= from_len <= l.total_len, (from_len, l.shared_len, l.total_len)
         keep = self._pages_for(from_len)
+        if self.win is not None:
+            self.win.truncate(l, keep)
         self.device.free([p for p, own in zip(l.pages[keep:], l.private[keep:]) if own])
         del l.pages[keep:], l.private[keep:]
         l.total_len = from_len
@@ -294,13 +349,20 @@ class HiCacheService(KVCacheService):
             self.counters["refused"] += 1
             return AcquireResult(status=AcquireStatus.REFUSED)
         k, end = plan
+        shared_len = sum(len(n.tokens) for n in nodes[:k])
+        if self.win is not None:
+            # Before any allocation, which could tombstone them.
+            self.win.pin_window_of(nodes[: min(k, n_dev)], shared_len, 0)
         loaded = self._load(nodes[n_dev:k])
+        if self.win is not None and k > n_dev:
+            start_page = sum(len(n.tokens) for n in nodes[:n_dev]) // self.ps
+            self.win.pin_window_of(nodes[n_dev:k], shared_len, start_page)
         anchor = nodes[k - 1] if k else self.index.root
         self.index.lock(anchor)
         self.index.unlock(guard)
-        shared_len = sum(len(n.tokens) for n in nodes[:k])
-        mut_pages = self._take(self._pages_for(end) - shared_len // self.ps)
-        assert mut_pages is not None, "headroom check admitted an unallocatable lease"
+        mut_pages, mut_windows = self._take_pair(
+            self._pages_for(end) - shared_len // self.ps
+        )
         lease = Lease(id=self._next_lease, namespace=ns, node=anchor, attrs=r.attrs)
         self._next_lease += 1
         for n in nodes[:k]:
@@ -309,6 +371,9 @@ class HiCacheService(KVCacheService):
         lease.pages.extend(mut_pages)
         lease.shared_len = lease.adopted_len = shared_len
         lease.total_len = end
+        if self.win is not None:
+            self.win.set_shared(lease, nodes[:k], shared_len)
+            self.win.add_private(lease, mut_windows)
         state = None
         if self.states is not None:
             state = self._grant_state(lease, path.device_len + path.host_len)
@@ -324,6 +389,15 @@ class HiCacheService(KVCacheService):
             mut_slots=self._slots(lease.pages, shared_len, end),
             loaded_len=loaded,
             state=state,
+            **self._window_slots(lease, 0, shared_len, end),
+        )
+
+    def _window_slots(self, lease: Lease, start: int, mid: int, end: int) -> dict:
+        if self.win is None:
+            return {}
+        return dict(
+            shared_window_slots=self.win.slots(lease.wpages, start, mid) if mid > start else None,
+            mut_window_slots=self.win.slots(lease.wpages, mid, end),
         )
 
     def _open_options(self, nodes: list[Node], n_dev: int) -> list[int]:
@@ -335,8 +409,15 @@ class HiCacheService(KVCacheService):
             with_state = [i + 1 for i in range(top) if self._has_state(nodes[i])]
             top = with_state[-1] if with_state else 0
             on_device = [i for i in with_state if i <= n_dev]
-            n_dev = on_device[-1] if on_device else 0
-        return [top, n_dev] if top > n_dev else [n_dev]
+            n_dev_ok = on_device[-1] if on_device else 0
+        elif self.win is not None:
+            valid = [k for k in range(top, 0, -1) if self.win.shared_ok(nodes, k, n_dev)]
+            top = valid[0] if valid else 0
+            on_device = [k for k in valid if k <= n_dev]
+            n_dev_ok = on_device[0] if on_device else 0
+        else:
+            n_dev_ok = n_dev
+        return [top, n_dev_ok] if top > n_dev_ok else [n_dev_ok]
 
     @staticmethod
     def _has_state(node: Node) -> bool:
@@ -396,11 +477,18 @@ class HiCacheService(KVCacheService):
             math.ceil(r.attrs.max_new_tokens * self.new_token_ratio)
         )
         room = self._headroom(self._reserved()) - own_reserve
+        window_room = self._window_room(
+            own_reserve=0 if self.win is None else self.win.lease_cap()
+        )
         for k in options:
             load_pages = sum(len(n.host_pages) for n in nodes[n_dev:k])
+            load_windows = sum(
+                len(self.index.live_windows(n.host_window_pages)) for n in nodes[n_dev:k]
+            )
             shared = sum(len(n.tokens) for n in nodes[:k])
-            end = self._grant_end(r, shared, room - load_pages)
-            if load_pages <= room and end is not None:
+            fit = min(room - load_pages, window_room - load_windows)
+            end = self._grant_end(r, shared, fit)
+            if load_pages <= room and load_windows <= window_room and end is not None:
                 return k, end
         return None
 
@@ -412,43 +500,61 @@ class HiCacheService(KVCacheService):
         pages = self._take(need)
         assert pages is not None, "headroom check admitted an unloadable prefix"
         host_pages = [p for n in nodes for p in n.host_pages]
-        op = self.dp.queue_load(host_pages, pages)
+        windows, node_windows = None, [None] * len(nodes)
+        if self.win is not None:
+            host_w = [w for n in nodes for w in self.index.live_windows(n.host_window_pages)]
+            dev_w = self.win.take(len(host_w))
+            assert dev_w is not None, "window headroom check admitted an unloadable prefix"
+            windows, it = (host_w, dev_w), iter(dev_w)
+            node_windows = [
+                None
+                if n.host_window_pages is None
+                else [None if w is None else next(it) for w in n.host_window_pages]
+                for n in nodes
+            ]
+        op = self.dp.queue_load(host_pages, pages, windows=windows)
         start = 0
-        for n in nodes:
+        for n, wp in zip(nodes, node_windows):
             k = len(n.host_pages)
-            self.index.commit_load(n, pages[start : start + k], op)
+            self.index.commit_load(n, pages[start : start + k], op, window_pages=wp)
             start += k
         return need * self.ps
 
     def _grow_pages(self, lease: Lease, end: int) -> int:
         return max(0, self._pages_for(end) - len(lease.pages))
 
-    def _extend(self, lease: Lease, end: int, pages: list[int]) -> AcquireResult:
+    def _extend(
+        self, lease: Lease, end: int, pages: list[int], windows: list[int]
+    ) -> AcquireResult:
         start = lease.total_len
         # Growth to an end the lease already covers grants nothing new.
         end = max(end, start)
         lease.pages.extend(pages)
         lease.private.extend([True] * len(pages))
         lease.total_len = end
+        if self.win is not None:
+            self.win.add_private(lease, windows)
         return AcquireResult(
             status=AcquireStatus.GRANTED,
             lease=lease.id,
             shared_len=lease.shared_len,
             total_len=end,
             mut_slots=self._slots(lease.pages, start, end),
+            mut_window_slots=None
+            if self.win is None
+            else self.win.slots(lease.wpages, start, end),
         )
 
     def _grow_flexible(self, r: AcquireReq) -> AcquireResult:
         """Prompt-phase growth (next chunk): grant what fits, or refuse."""
         lease = self.leases[r.lease]
-        room = self._headroom(self._reserved())
+        room = min(self._headroom(self._reserved()), self._window_room())
         end = self._grant_end(r, lease.total_len, room)
         if end is None:
             self.counters["refused"] += 1
             return AcquireResult(status=AcquireStatus.REFUSED, lease=lease.id)
-        pages = self._take(self._grow_pages(lease, end))
-        assert pages is not None
-        return self._extend(lease, end, pages)
+        pages, windows = self._take_pair(self._grow_pages(lease, end))
+        return self._extend(lease, end, pages, windows)
 
     def _grow_all(
         self, reqs: Sequence[AcquireReq], idx: list[int], results: list
@@ -456,12 +562,16 @@ class HiCacheService(KVCacheService):
         """Decode-phase growth must succeed: revoke leases until it fits."""
         live = list(idx)
         need = {i: self._grow_pages(self.leases[reqs[i].lease], reqs[i].end) for i in live}
-        pages = None
+        pages = windows = None
         while live:
             total = sum(need[i] for i in live)
-            if total <= self.device.num_free + self.index.evictable_device_pages:
+            if total <= self.device.num_free + self.index.evictable_device_pages and (
+                self.win is None or total <= self.win.headroom(0)
+            ):
                 pages = self._take(total)
                 if pages is not None:
+                    windows = [] if self.win is None else self.win.take(total)
+                    assert windows is not None
                     break
             victim = min(live, key=lambda i: self._victim_key(self.leases[reqs[i].lease]))
             live.remove(victim)
@@ -477,7 +587,10 @@ class HiCacheService(KVCacheService):
         for i in live:
             k = need[i]
             results[i] = self._extend(
-                self.leases[reqs[i].lease], reqs[i].end, pages[start : start + k]
+                self.leases[reqs[i].lease],
+                reqs[i].end,
+                pages[start : start + k],
+                windows[start : start + k] if self.win is not None else [],
             )
             start += k
 
@@ -513,11 +626,19 @@ class HiCacheService(KVCacheService):
         pub = upto // self.ps * self.ps
         if pub <= lease.shared_len:
             return
-        out = self.index.insert(lease.namespace, token_ids[:pub], lease.pages[: pub // self.ps])
+        n = pub // self.ps
+        out = self.index.insert(
+            lease.namespace,
+            token_ids[:pub],
+            lease.pages[:n],
+            window_pages=None if self.win is None else lease.wpages[:n],
+        )
         for i, adopted in enumerate(out.adopted):
             if adopted:
                 assert lease.private[i]
                 lease.private[i] = False
+        if self.win is not None:
+            self.win.adopt(lease, out.adopted)
         self.index.lock(out.last_node)
         self.index.unlock(lease.node)
         lease.node = out.last_node
@@ -562,6 +683,7 @@ class HiCacheService(KVCacheService):
     def _write_through(self, node: Node) -> None:
         nodes = self.index.unbacked_on_path(node)
         dev, host, backed = [], [], []
+        dev_w, host_w = [], []
         for n in nodes:
             hp = self._take_host(len(n.device_pages))
             if hp is None:
@@ -569,19 +691,37 @@ class HiCacheService(KVCacheService):
                 break
             dev.extend(n.device_pages)
             host.extend(hp)
-            backed.append((n, hp))
+            backed.append((n, hp, self._backup_windows(n, dev_w, host_w)))
         if not backed:
             return
-        op = self.dp.backup(dev, host, after=self._latest_done)
-        for n, hp in backed:
-            self.index.set_backup(n, hp, op)
+        op = self.dp.backup(
+            dev, host, after=self._latest_done, windows=(dev_w, host_w) if dev_w else None
+        )
+        for n, hp, hw in backed:
+            self.index.set_backup(n, hp, op, host_window_pages=hw)
         self.counters["backed_up_pages"] += len(dev)
+
+    def _backup_windows(self, node: Node, dev_w: list, host_w: list) -> Optional[list]:
+        """Host window pages for ``node``'s live window pages (appended to the
+        copy lists); None entries where none was copied."""
+        live = self.index.live_windows(node.window_pages)
+        if not live:
+            return None
+        got = self._take_host_windows(len(live))
+        if got is None:
+            return None
+        dev_w.extend(live)
+        host_w.extend(got)
+        it = iter(got)
+        return [None if w is None else next(it) for w in node.window_pages]
 
     def _end(self, lease: Lease) -> None:
         self.index.unlock(lease.node)
         self.device.free([p for p, own in zip(lease.pages, lease.private) if own])
         if lease.state_slots:
             self.states.free(lease.state_slots)
+        if self.win is not None:
+            self.win.end(lease)
         del self.leases[lease.id]
 
     # ===== Control plane =====
@@ -601,6 +741,9 @@ class HiCacheService(KVCacheService):
             state_slots=0 if self.states is None else self.states.num_pages,
             state_free_slots=0 if self.states is None else self.states.num_free,
             cached_states=self.index.num_states,
+            window_pages=0 if self.win is None else self.win.alloc.num_pages,
+            window_free_pages=0 if self.win is None else self.win.alloc.num_free,
+            cached_window_pages=self.index.window_pages_cached,
             counters=dict(self.counters),
         )
 
@@ -615,6 +758,10 @@ class HiCacheService(KVCacheService):
             self.states.free(device.states)
             if host.states:
                 self.sp.free_host(host.states)
+        if self.win is not None:
+            self.win.alloc.free(device.windows)
+            if host.windows:
+                self.dp.free_host_windows(host.windows)
         return True
 
     def close(self) -> None:

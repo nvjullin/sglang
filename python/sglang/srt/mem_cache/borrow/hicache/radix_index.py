@@ -11,6 +11,10 @@ Invariants:
   the state after the node's last token; a device state needs device pages and
   a host state needs host pages. States carry no locks: every reader of a
   state slot is ordered before its reuse on the service's state stream.
+- With a sliding window, each device page may have a window page (None: a
+  tombstone, its window KV is gone); likewise on host. Leases pin the window
+  pages they read by page id, so pins survive node splits; eviction only
+  tombstones unpinned window pages.
 """
 
 from __future__ import annotations
@@ -35,6 +39,8 @@ class Node:
         "h2d_op",
         "state",
         "host_state",
+        "window_pages",
+        "host_window_pages",
     )
 
     def __init__(self, *, id: int, parent: Optional[Node], tokens: tuple):
@@ -51,6 +57,9 @@ class Node:
         self.h2d_op: Any = None
         self.state: Optional[int] = None
         self.host_state: Optional[int] = None
+        # Per page of device_pages / host_pages: window page or None.
+        self.window_pages: Optional[list] = None
+        self.host_window_pages: Optional[list] = None
 
     def __repr__(self) -> str:
         return (
@@ -71,6 +80,8 @@ class Evicted(msgspec.Struct):
     pages: list
     # Recurrent-state slots the evicted nodes held (device or host tier).
     states: list
+    # Window pages the evicted nodes held (device or host tier).
+    windows: list = []
 
 
 class InsertOutcome(msgspec.Struct):
@@ -96,6 +107,11 @@ class PrefixIndex:
         self._host_leaves: set[Node] = set()
         self._state_nodes: set[Node] = set()
         self._host_state_nodes: set[Node] = set()
+        self._window_nodes: set[Node] = set()
+        self._host_window_nodes: set[Node] = set()
+        self.window_pages_cached = 0
+        # Window page id -> number of leases pinning it.
+        self._window_pins: dict[int, int] = {}
 
     # ===== Lookup =====
 
@@ -188,6 +204,14 @@ class PrefixIndex:
         if node.host_pages is not None:
             head.host_pages = node.host_pages[:cut]
             node.host_pages = node.host_pages[cut:]
+        if node.window_pages is not None:
+            head.window_pages = node.window_pages[:cut]
+            node.window_pages = node.window_pages[cut:]
+        if node.host_window_pages is not None:
+            head.host_window_pages = node.host_window_pages[:cut]
+            node.host_window_pages = node.host_window_pages[cut:]
+        self._track_windows(head)
+        self._track_windows(node)
         head.lock_ref = node.lock_ref
         head.last_access = node.last_access
         head.d2h_op, head.h2d_op = node.d2h_op, node.h2d_op
@@ -253,6 +277,8 @@ class PrefixIndex:
         del parent.children[self._key_in_parent(node)]
         self._device_leaves.discard(node)
         self._host_leaves.discard(node)
+        self._window_nodes.discard(node)
+        self._host_window_nodes.discard(node)
         self._update_leaf_sets(parent)
 
     # ===== Locks =====
@@ -275,17 +301,30 @@ class PrefixIndex:
 
     # ===== Mutation by leases =====
 
-    def commit_load(self, node: Node, device_pages: list[int], op: Any) -> None:
+    def commit_load(
+        self,
+        node: Node,
+        device_pages: list[int],
+        op: Any,
+        window_pages: Optional[list] = None,
+    ) -> None:
         """Make a host-only node device-resident; ``op`` fills its pages."""
         assert node.device_pages is None and node.host_pages is not None
         assert node.parent.device_pages is not None
         node.h2d_op = op
         self._set_device_pages(node, device_pages)
+        self._set_window_pages(node, window_pages)
 
     def insert(
-        self, namespace: tuple, tokens: Sequence[int], pages: Sequence[int]
+        self,
+        namespace: tuple,
+        tokens: Sequence[int],
+        pages: Sequence[int],
+        window_pages: Optional[Sequence] = None,
     ) -> InsertOutcome:
-        """Cache ``tokens`` backed by ``pages`` (one per page of tokens)."""
+        """Cache ``tokens`` backed by ``pages`` (one per page of tokens) and,
+        with a sliding window, ``window_pages`` (None entries: tombstones).
+        A node that takes the caller's pages takes their window pages too."""
         ps = self.page_size
         assert len(tokens) % ps == 0 and len(pages) == len(tokens) // ps
         self.clock += 1
@@ -297,7 +336,9 @@ class PrefixIndex:
             if child is None:
                 child = self._new_node(node, tuple(tokens[pos:]))
                 node.children[self._child_key(node, namespace, tokens, pos)] = child
-                self._take_pages(child, pages, pos // ps, adopted, new_resident)
+                self._take_pages(
+                    child, pages, window_pages, pos // ps, adopted, new_resident
+                )
                 child.last_access = self.clock
                 node = child
                 break
@@ -306,7 +347,9 @@ class PrefixIndex:
             if common < len(child.tokens):
                 child = self._split(child, common)
             if child.device_pages is None:
-                self._take_pages(child, pages, pos // ps, adopted, new_resident)
+                self._take_pages(
+                    child, pages, window_pages, pos // ps, adopted, new_resident
+                )
             child.last_access = self.clock
             pos += common
             node = child
@@ -316,20 +359,31 @@ class PrefixIndex:
         self,
         node: Node,
         pages: Sequence[int],
+        window_pages: Optional[Sequence],
         first: int,
         adopted: list[bool],
         new_resident: list[Node],
     ) -> None:
         n = len(node.tokens) // self.page_size
         self._set_device_pages(node, list(pages[first : first + n]))
+        if window_pages is not None:
+            self._set_window_pages(node, list(window_pages[first : first + n]))
         for i in range(first, first + n):
             adopted[i] = True
         new_resident.append(node)
 
-    def set_backup(self, node: Node, host_pages: list[int], op: Any) -> None:
+    def set_backup(
+        self,
+        node: Node,
+        host_pages: list[int],
+        op: Any,
+        host_window_pages: Optional[list] = None,
+    ) -> None:
         assert node.device_pages is not None and node.host_pages is None
         node.d2h_op = op
         self._set_host_pages(node, host_pages)
+        node.host_window_pages = host_window_pages
+        self._track_windows(node)
 
     def unbacked_on_path(self, node: Node) -> list[Node]:
         """Device-resident, unbacked nodes from the root down to ``node``."""
@@ -402,6 +456,82 @@ class PrefixIndex:
             self._drop_host_state(node, out)
         return out
 
+    # ===== Sliding window =====
+
+    @staticmethod
+    def live_windows(pages: Optional[list]) -> list[int]:
+        return [] if pages is None else [w for w in pages if w is not None]
+
+    def _track_windows(self, node: Node) -> None:
+        for pages, nodes in (
+            (node.window_pages, self._window_nodes),
+            (node.host_window_pages, self._host_window_nodes),
+        ):
+            if self.live_windows(pages):
+                nodes.add(node)
+            else:
+                nodes.discard(node)
+
+    def _set_window_pages(self, node: Node, pages: Optional[list]) -> None:
+        delta = len(self.live_windows(pages)) - len(self.live_windows(node.window_pages))
+        self.window_pages_cached += delta
+        node.window_pages = pages
+        self._track_windows(node)
+
+    def _drop_windows(self, node: Node, out: list[int]) -> None:
+        live = self.live_windows(node.window_pages)
+        assert not any(w in self._window_pins for w in live), f"evicting pinned windows of {node}"
+        out.extend(live)
+        self._set_window_pages(node, None)
+
+    def _drop_host_windows(self, node: Node, out: list[int]) -> None:
+        out.extend(self.live_windows(node.host_window_pages))
+        node.host_window_pages = None
+        self._track_windows(node)
+
+    def pin_windows(self, pages: Sequence[int]) -> None:
+        for w in pages:
+            self._window_pins[w] = self._window_pins.get(w, 0) + 1
+
+    def unpin_windows(self, pages: Sequence[int]) -> None:
+        for w in pages:
+            left = self._window_pins[w] - 1
+            if left:
+                self._window_pins[w] = left
+            else:
+                del self._window_pins[w]
+
+    @property
+    def evictable_window_pages(self) -> int:
+        # Only cached window pages are ever pinned.
+        return self.window_pages_cached - len(self._window_pins)
+
+    def evict_windows(self, num: int) -> list[int]:
+        """Tombstone up to ``num`` unpinned device window pages, LRU nodes
+        first; the nodes keep their KV pages."""
+        out: list[int] = []
+        for _, _, node in sorted((n.last_access, n.id, n) for n in self._window_nodes):
+            if len(out) >= num:
+                break
+            kept = []
+            for w in node.window_pages:
+                if w is not None and w not in self._window_pins and len(out) < num:
+                    out.append(w)
+                    kept.append(None)
+                else:
+                    kept.append(w)
+            self._set_window_pages(node, kept)
+        return out
+
+    def evict_host_windows(self, num: int) -> list[int]:
+        """Drop up to ``num`` host window pages, LRU nodes first."""
+        out: list[int] = []
+        for _, _, node in sorted((n.last_access, n.id, n) for n in self._host_window_nodes):
+            if len(out) >= num:
+                break
+            self._drop_host_windows(node, out)
+        return out
+
     # ===== Eviction =====
 
     def _device_evictable(self, node: Node) -> bool:
@@ -421,6 +551,7 @@ class PrefixIndex:
         heapq.heapify(heap)
         freed: list[int] = []
         states: list[int] = []
+        windows: list[int] = []
         while heap and len(freed) < num_pages:
             _, _, node = heapq.heappop(heap)
             if node not in self._device_leaves or not self._device_evictable(node):
@@ -431,6 +562,7 @@ class PrefixIndex:
             node.d2h_op = node.h2d_op = None
             freed.extend(node.device_pages)
             self._drop_state(node, states)
+            self._drop_windows(node, windows)
             parent = node.parent
             self._set_device_pages(node, None)
             if node.host_pages is None:
@@ -439,7 +571,7 @@ class PrefixIndex:
                 self._remove_leaf(node)
             if parent in self._device_leaves and self._device_evictable(parent):
                 heapq.heappush(heap, (parent.last_access, parent.id, parent))
-        return Evicted(pages=freed, states=states)
+        return Evicted(pages=freed, states=states, windows=windows)
 
     def evict_host(self, num_pages: int) -> Evicted:
         """Free at least ``num_pages`` host pages if possible, LRU first."""
@@ -447,6 +579,7 @@ class PrefixIndex:
         heapq.heapify(heap)
         freed: list[int] = []
         states: list[int] = []
+        windows: list[int] = []
         while heap and len(freed) < num_pages:
             _, _, node = heapq.heappop(heap)
             if node not in self._host_leaves:
@@ -455,18 +588,21 @@ class PrefixIndex:
                 node.d2h_op.wait()
             freed.extend(node.host_pages)
             self._drop_host_state(node, states)
+            self._drop_host_windows(node, windows)
             parent = node.parent
             self._set_host_pages(node, None)
             self._remove_leaf(node)
             if parent in self._host_leaves:
                 heapq.heappush(heap, (parent.last_access, parent.id, parent))
-        return Evicted(pages=freed, states=states)
+        return Evicted(pages=freed, states=states, windows=windows)
 
     def drop_all(self) -> tuple[Evicted, Evicted]:
         """Remove every node; returns what the device and host tiers held.
         Needs no locks."""
+        assert not self._window_pins, "dropping the index while leases pin windows"
         device, host, stack = [], [], list(self.root.children.values())
         states, host_states = [], []
+        windows, host_windows = [], []
         while stack:
             node = stack.pop()
             assert node.lock_ref == 0
@@ -477,6 +613,11 @@ class PrefixIndex:
             host.extend(node.host_pages or ())
             self._drop_state(node, states)
             self._drop_host_state(node, host_states)
+            self._drop_windows(node, windows)
+            self._drop_host_windows(node, host_windows)
             stack.extend(node.children.values())
         self.__init__(page_size=self.page_size)
-        return Evicted(pages=device, states=states), Evicted(pages=host, states=host_states)
+        return (
+            Evicted(pages=device, states=states, windows=windows),
+            Evicted(pages=host, states=host_states, windows=host_windows),
+        )

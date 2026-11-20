@@ -18,6 +18,13 @@ grant. The service initializes the working slot to the state after
 may name the lease's state slot that holds the state at a page-aligned length
 (``StateAnchor``); the service copies it, so the slot stays the lease's.
 
+Sliding window: when the device KV has a window pool (its own slot id space),
+positions a forward may read through the window also borrow a window slot,
+returned next to the KV slot ids (0 where none is borrowed, e.g. a shared
+position older than the window). The runtime maps KV slot -> window slot in
+its own table, and drops window borrows behind the window with
+``release(lease, window_below=p)``.
+
 Lockstep: a runtime that replicates its scheduler per rank must issue the same
 calls, in the same order, with the same arguments, on every rank that shares a
 service replica group; answers are then identical on all of them.
@@ -114,6 +121,9 @@ class AcquireResult(msgspec.Struct, frozen=True):
     loaded_len: int = 0
     # Set on the grant that opens a lease when the service caches state.
     state: Optional[StateGrant] = None
+    # With a window pool: window slot ids aligned with shared_slots / mut_slots.
+    shared_window_slots: Optional[torch.Tensor] = None
+    mut_window_slots: Optional[torch.Tensor] = None
 
 
 class Ready(msgspec.Struct, frozen=True):
@@ -164,6 +174,10 @@ class CacheStats(msgspec.Struct, frozen=True):
     state_slots: int = 0
     state_free_slots: int = 0
     cached_states: int = 0
+    # Window pages (0 without a window pool).
+    window_pages: int = 0
+    window_free_pages: int = 0
+    cached_window_pages: int = 0
     counters: dict = {}
 
 
@@ -200,13 +214,16 @@ class KVCacheService(ABC):
         self,
         lease: int,
         *,
-        from_len: int = 0,
+        from_len: Optional[int] = 0,
         publish_token_ids: Optional[Sequence[int]] = None,
         state: Optional[StateAnchor] = None,
+        window_below: Optional[int] = None,
     ) -> None:
-        """Publish ``publish_token_ids`` (with ``state``) if given, then drop
-        every borrow at positions ``>= from_len``. ``from_len == 0`` ends the
-        lease and its state slots."""
+        """Publish ``publish_token_ids`` (with ``state``) if given; drop the
+        window borrows of positions ``< window_below`` if given (valid after the
+        ``end_batch`` of every batch that read them); then drop every borrow at
+        positions ``>= from_len``. ``from_len == 0`` ends the lease and its
+        state slots; ``from_len=None`` keeps the rest."""
 
     @abstractmethod
     def poll(self) -> list:

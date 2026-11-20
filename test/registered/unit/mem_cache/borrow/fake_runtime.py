@@ -52,12 +52,24 @@ class FakeOp(TransferOp):
 
 
 class FakeDataPlane(DataPlane):
-    def __init__(self, *, page_size: int, host_num_pages: int, device_kv: np.ndarray):
+    def __init__(
+        self,
+        *,
+        page_size: int,
+        host_num_pages: int,
+        device_kv: np.ndarray,
+        device_window_kv: Optional[np.ndarray] = None,
+        host_num_window_pages: int = 0,
+    ):
         self.page_size = page_size
         self.host_num_pages = host_num_pages
         self._host = PageAllocator(num_pages=host_num_pages)
         self.device_kv = device_kv
         self.host_kv = np.full(host_num_pages * page_size, -1, dtype=np.int64)
+        self.device_window_kv = device_window_kv
+        self.host_num_window_pages = host_num_window_pages
+        self._host_windows = PageAllocator(num_pages=host_num_window_pages)
+        self.host_window_kv = np.full(max(host_num_window_pages, 1) * page_size, -1, dtype=np.int64)
         self._queued: list = []
         self.launches = 0
 
@@ -74,20 +86,37 @@ class FakeDataPlane(DataPlane):
     def free_host(self, pages: Sequence[int]) -> None:
         self._host.free(pages)
 
-    def backup(self, device_pages, host_pages, *, after: Any) -> TransferOp:
+    def host_window_pages_free(self) -> int:
+        return self._host_windows.num_free
+
+    def alloc_host_windows(self, num_pages: int) -> Optional[list[int]]:
+        return self._host_windows.alloc(num_pages)
+
+    def free_host_windows(self, pages: Sequence[int]) -> None:
+        self._host_windows.free(pages)
+
+    def backup(self, device_pages, host_pages, *, after: Any, windows=None) -> TransferOp:
         self.host_kv[self._slots(host_pages)] = self.device_kv[self._slots(device_pages)]
+        if windows is not None and windows[0]:
+            dev_w, host_w = windows
+            self.host_window_kv[self._slots(host_w)] = self.device_window_kv[self._slots(dev_w)]
         return FakeOp(launched=True)
 
-    def queue_load(self, host_pages, device_pages) -> TransferOp:
+    def queue_load(self, host_pages, device_pages, windows=None) -> TransferOp:
         op = FakeOp(launched=False)
-        self._queued.append((list(host_pages), list(device_pages), op))
+        self._queued.append((list(host_pages), list(device_pages), windows, op))
         return op
 
     def launch_loads(self, *, after: Any) -> Optional[Fence]:
         if not self._queued:
             return None
-        for host_pages, device_pages, op in self._queued:
+        for host_pages, device_pages, windows, op in self._queued:
             self.device_kv[self._slots(device_pages)] = self.host_kv[self._slots(host_pages)]
+            if windows is not None and windows[0]:
+                host_w, dev_w = windows
+                self.device_window_kv[self._slots(dev_w)] = self.host_window_kv[
+                    self._slots(host_w)
+                ]
             op.launched = True
         self._queued = []
         self.launches += 1
@@ -162,6 +191,8 @@ class FakeReq:
         self.branch_len: Optional[int] = None
         self.tracked: Optional[tuple[int, int]] = None
         self.next_track = 0
+        # Window slot per position (0: no window borrow).
+        self.wslots: list[int] = []
 
     @property
     def tokens(self) -> list[int]:
@@ -179,11 +210,17 @@ class FakeRuntime:
         seed: int = 0,
         state: Optional[FakeStatePlane] = None,
         checkpoint_grid: int = 0,
+        window_kv: Optional[np.ndarray] = None,
+        window_tokens: int = 0,
+        page_size: int = 1,
     ):
         self.svc = service
         self.kv = device_kv
         self.state = state
         self.grid = checkpoint_grid
+        self.window_kv = window_kv
+        self.window = window_tokens
+        self.ps = page_size
         self.rng = random.Random(seed)
         self.batch_id = 0
         self.revoked: list[FakeReq] = []
@@ -210,6 +247,10 @@ class FakeRuntime:
         req.slots = res.shared_slots.tolist() + res.mut_slots.tolist()
         req.computed = res.shared_len
         assert len(req.slots) == res.total_len
+        if self.window:
+            shared_w = [] if res.shared_window_slots is None else res.shared_window_slots.tolist()
+            req.wslots = shared_w + res.mut_window_slots.tolist()
+            assert len(req.wslots) == res.total_len
         assert (res.state is not None) == (self.state is not None)
         if res.state is not None:
             req.state_slots = list(res.state.slots)
@@ -233,6 +274,8 @@ class FakeRuntime:
             return False
         req.slots += res.mut_slots.tolist()
         assert len(req.slots) == res.total_len
+        if self.window:
+            req.wslots += res.mut_window_slots.tolist()
         return True
 
     def forward(self, reqs: Sequence[FakeReq]) -> Optional[Fence]:
@@ -249,11 +292,31 @@ class FakeRuntime:
                 )
             for p in range(r.computed, len(r.slots)):
                 self.kv[r.slots[p]] = kv_content(r.namespace, toks, p)
+            if self.window:
+                self._window_forward(r, toks)
             if self.state is not None:
                 self._advance_state(r, toks, len(r.slots))
             r.computed = len(r.slots)
         self.svc.end_batch(self.batch_id, done_event=None)
         return fence
+
+    def _window_forward(self, r: FakeReq, toks: list[int]) -> None:
+        """Check the window KV the extend reads, write the new positions'."""
+        for p in range(max(0, r.computed - self.window), r.computed):
+            assert r.wslots[p] != 0, f"rid={r.rid} pos={p} has no window slot"
+            assert self.window_kv[r.wslots[p]] == kv_content(r.namespace, toks, p), (
+                f"rid={r.rid} pos={p} holds wrong window KV"
+            )
+        for p in range(r.computed, len(r.slots)):
+            assert r.wslots[p] != 0, f"rid={r.rid} new pos={p} has no window slot"
+            self.window_kv[r.wslots[p]] = kv_content(r.namespace, toks, p)
+
+    def retire_windows(self, req: FakeReq) -> None:
+        """Drop the window borrows a later forward will not read."""
+        below = max(0, req.computed - self.window) // self.ps * self.ps
+        self.svc.release(req.lease, window_below=below, from_len=None)
+        for p in range(below):
+            req.wslots[p] = 0
 
     def _advance_state(self, r: FakeReq, toks: list[int], end: int) -> None:
         """Check the working state, run it to ``end`` and track one checkpoint:
@@ -301,6 +364,8 @@ class FakeRuntime:
                 continue
             assert res.status == AcquireStatus.GRANTED
             r.slots += res.mut_slots.tolist()
+            if self.window:
+                r.wslots += res.mut_window_slots.tolist()
             r.out += [self.rng.randrange(1, 50) for _ in range(k)]
             alive.append(r)
         return alive

@@ -63,6 +63,8 @@ class HostMirror(msgspec.Struct, frozen=True):
     host_pool: Any
     layer_mapper: Optional[Callable[[int], Optional[int]]] = None
     packed_draft_pools: tuple = ()
+    # "window": indexed by window page ids (a sliding-window pool), else KV page ids.
+    space: str = "kv"
 
 
 def _staged_write(host_pool: Any, io_backend: str) -> bool:
@@ -100,10 +102,13 @@ class GpuDataPlane(DataPlane):
         self._mirrors = tuple(mirrors)
         for m in self._mirrors:
             assert m.host_pool.logical_page_size == page_size
-        self.host_num_pages = min(
-            m.host_pool.logical_size // page_size for m in self._mirrors
-        )
+        kv, window = self._space_mirrors("kv"), self._space_mirrors("window")
+        self.host_num_pages = min(m.host_pool.logical_size // page_size for m in kv)
         self._host = PageAllocator(num_pages=self.host_num_pages)
+        self.host_num_window_pages = (
+            min(m.host_pool.logical_size // page_size for m in window) if window else 0
+        )
+        self._host_windows = PageAllocator(num_pages=self.host_num_window_pages)
         self.engine = L2TransferEngine(io_backend)
         self.side_stream = torch.cuda.Stream(device=device)
         self._layer_count = (
@@ -114,6 +119,9 @@ class GpuDataPlane(DataPlane):
         self.counter = ServiceLayerCounter(self._layer_count)
         self._queued: list[tuple[list[int], list[int], _GpuOp]] = []
 
+    def _space_mirrors(self, space: str) -> list[HostMirror]:
+        return [m for m in self._mirrors if m.space == space]
+
     def _slots(self, pages: Sequence[int], *, on_device: bool) -> torch.Tensor:
         ps = self.page_size
         page_t = torch.tensor(list(pages), dtype=torch.int64)
@@ -123,13 +131,36 @@ class GpuDataPlane(DataPlane):
         return slots.pin_memory().to(self.device, non_blocking=True)
 
     def _transfers(
-        self, host_pages: Sequence[int], device_pages: Sequence[int], *, write: bool
+        self,
+        host_pages: Sequence[int],
+        device_pages: Sequence[int],
+        *,
+        write: bool,
+        windows: Optional[tuple] = None,
+    ) -> list[L2Transfer]:
+        """``windows`` = (host window pages, device window pages)."""
+        transfers = self._space_transfers(
+            self._space_mirrors("kv"), host_pages, device_pages, write=write
+        )
+        if windows is not None and windows[0]:
+            transfers += self._space_transfers(
+                self._space_mirrors("window"), windows[0], windows[1], write=write
+            )
+        return transfers
+
+    def _space_transfers(
+        self,
+        mirrors: Sequence[HostMirror],
+        host_pages: Sequence[int],
+        device_pages: Sequence[int],
+        *,
+        write: bool,
     ) -> list[L2Transfer]:
         device_ids = self._slots(device_pages, on_device=True)
         host_gpu = self._slots(host_pages, on_device=True)
         host_cpu = self._slots(host_pages, on_device=False)
         transfers = []
-        for m in self._mirrors:
+        for m in mirrors:
             staged = write and _staged_write(m.host_pool, self.io_backend)
             transfers.append(
                 L2Transfer(
@@ -173,32 +204,53 @@ class GpuDataPlane(DataPlane):
     def free_host(self, pages: Sequence[int]) -> None:
         self._host.free(pages)
 
-    def backup(self, device_pages, host_pages, *, after: Any) -> TransferOp:
+    def host_window_pages_free(self) -> int:
+        return self._host_windows.num_free
+
+    def alloc_host_windows(self, num_pages: int) -> Optional[list[int]]:
+        return self._host_windows.alloc(num_pages)
+
+    def free_host_windows(self, pages: Sequence[int]) -> None:
+        self._host_windows.free(pages)
+
+    def backup(self, device_pages, host_pages, *, after: Any, windows=None) -> TransferOp:
         op = _GpuOp()
         with torch.cuda.stream(self.side_stream):
             if after is not None:
                 self.side_stream.wait_event(after)
             completion = self.engine.submit_device_to_host(
-                self._transfers(host_pages, device_pages, write=True)
+                self._transfers(
+                    host_pages,
+                    device_pages,
+                    write=True,
+                    windows=None if windows is None else (windows[1], windows[0]),
+                )
             )
         op.launched, op.event = True, completion.finish_event
         return op
 
-    def queue_load(self, host_pages, device_pages) -> TransferOp:
+    def queue_load(self, host_pages, device_pages, windows=None) -> TransferOp:
         op = _GpuOp()
-        self._queued.append((list(host_pages), list(device_pages), op))
+        host_w, device_w = ([], []) if windows is None else windows
+        self._queued.append(
+            (list(host_pages), list(device_pages), list(host_w), list(device_w), op)
+        )
         return op
 
     def launch_loads(self, *, after: Any) -> Optional[Fence]:
         if not self._queued:
             return None
-        host_pages = [p for h, _, _ in self._queued for p in h]
-        device_pages = [p for _, d, _ in self._queued for p in d]
+        host_pages = [p for q in self._queued for p in q[0]]
+        device_pages = [p for q in self._queued for p in q[1]]
+        host_w = [p for q in self._queued for p in q[2]]
+        device_w = [p for q in self._queued for p in q[3]]
         with torch.cuda.stream(self.side_stream):
             if after is not None:
                 self.side_stream.wait_event(after)
             # Index copies go first: the transfer waits only on the start event.
-            transfers = self._transfers(host_pages, device_pages, write=False)
+            transfers = self._transfers(
+                host_pages, device_pages, write=False, windows=(host_w, device_w)
+            )
             index = self.counter.update_producer()
             layer_events = self.counter.events[index]
             layer_events.start_event.record()
@@ -208,8 +260,8 @@ class GpuDataPlane(DataPlane):
                 on_layer_done=layer_events.complete,
                 transfer_layer_id_max=self._layer_count,
             )
-        for _, _, op in self._queued:
-            op.launched, op.event = True, layer_events.finish_event
+        for q in self._queued:
+            q[-1].launched, q[-1].event = True, layer_events.finish_event
         self._queued = []
         return Fence(consumer_index=index, final_event=layer_events.finish_event)
 

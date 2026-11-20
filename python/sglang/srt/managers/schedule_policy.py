@@ -519,7 +519,9 @@ class SchedulePolicy:
             or get_memory().radix_eviction_policy.lower()
             not in ("lru", "joint_lru", "state_cost")
             or self.tree_cache.supports_fast_match_prefix()
-            or not self.tree_cache.supports_prefix_sharing()
+            or not (
+                self.tree_cache.supports_prefix_sharing() or self.tree_cache.lends_kv
+            )
         ):
             return
         refresh = (

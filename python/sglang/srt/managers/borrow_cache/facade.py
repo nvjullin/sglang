@@ -12,6 +12,7 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 
 from sglang.srt.managers.borrow_cache.client import BorrowCacheClient
+from sglang.srt.mem_cache.borrow.api import CacheKey
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     EvictParams,
@@ -22,6 +23,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.mem_cache.radix_cache import RadixKey
 
 
 class _Root:
@@ -71,6 +73,13 @@ class BorrowTreeFacade(BasePrefixCache):
 
     def supports_prefix_sharing(self) -> bool:
         return False
+
+    def touch_prefix(self, key: RadixKey) -> None:
+        # The advisory query lets the service refresh the prefix's recency.
+        tokens = key.token_ids if key.limit is None else key.token_ids[: key.limit]
+        self.client.service.query(
+            [CacheKey(token_ids=tokens, namespace=(key.extra_key, key.cache_salt))]
+        )
 
     def lock(self, node: Any):
         return None

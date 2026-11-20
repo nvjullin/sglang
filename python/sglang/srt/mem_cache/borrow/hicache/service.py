@@ -145,7 +145,7 @@ class HiCacheService(KVCacheService):
     def query(self, keys: Sequence[CacheKey]) -> list[QueryResult]:
         out = []
         for key in keys:
-            ready, cached = self.index.peek(key.namespace, key.token_ids)
+            ready, cached = self.index.peek(key.namespace, key.token_ids, touch=True)
             out.append(QueryResult(ready_len=ready, cached_len=cached))
         return out
 

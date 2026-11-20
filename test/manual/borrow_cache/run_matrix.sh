@@ -19,6 +19,7 @@ case_args() {
              echo "--num-prefixes 8 --prefix-len 1500 --rounds 3 -- --model-path $MODEL $HI $DET --max-total-tokens 8192 --page-size 16 --disable-overlap-schedule" ;;
     device_only)
              echo "--num-prefixes 8 --prefix-len 1500 --rounds 3 -- --model-path $MODEL $DET --max-total-tokens 8192 --page-size 16" ;;
+    eagle3)  echo "--num-prefixes 8 --prefix-len 1500 --rounds 3 --max-new-tokens 64 -- --model-path Qwen/Qwen3-8B --speculative-algorithm EAGLE3 --speculative-draft-model-path ${EAGLE_DRAFT:?set EAGLE_DRAFT} --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 $HI $DET --max-total-tokens 12288 --page-size 16" ;;
     tp2dp2)  echo "--num-prefixes 8 --prefix-len 1500 --rounds 3 --max-new-tokens 64 -- --model-path $MODEL $HI $DET --max-total-tokens 8192 --page-size 16 --tp 2 --dp 2 --enable-dp-attention" ;;
     tp2)     echo "--num-prefixes 8 --prefix-len 1500 --rounds 3 --max-new-tokens 128 -- --model-path $MODEL $HI $DET --max-total-tokens 8192 --page-size 16 --chunked-prefill-size 2048 --tp 2" ;;
     *) echo "unknown case $1" >&2; exit 2 ;;

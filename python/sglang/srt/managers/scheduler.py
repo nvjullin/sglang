@@ -6071,6 +6071,8 @@ class Scheduler(
         return self.external_corpus_manager.list(recv_req)
 
     def clear_hicache_storage_wrapped(self, recv_req: ClearHiCacheReqInput):
+        if self.tree_cache.lends_kv:
+            return ClearHiCacheReqOutput(success=False)
         if self.enable_hierarchical_cache or self.enable_lmcache:
             self.tree_cache.clear_storage_backend()
             logger.info("Hierarchical cache or LMCache cleared successfully!")
@@ -6256,6 +6258,8 @@ class Scheduler(
             return AttachHiCacheStorageReqOutput(
                 success=False, message="Hierarchical cache is not enabled."
             )
+        if self.tree_cache.lends_kv:
+            return AttachHiCacheStorageReqOutput(success=False, message="L3 storage is not supported with SGLANG_ENABLE_DECOUPLED_HICACHE.")
 
         if not self.is_fully_idle():
             return AttachHiCacheStorageReqOutput(
@@ -6312,6 +6316,8 @@ class Scheduler(
             return DetachHiCacheStorageReqOutput(
                 success=False, message="Hierarchical cache is not enabled."
             )
+        if self.tree_cache.lends_kv:
+            return DetachHiCacheStorageReqOutput(success=False, message="L3 storage is not supported with SGLANG_ENABLE_DECOUPLED_HICACHE.")
 
         if not self.is_fully_idle():
             return DetachHiCacheStorageReqOutput(
@@ -6408,6 +6414,8 @@ class Scheduler(
             return disabled_l3_layout(
                 "Hierarchical cache is disabled", page_size=self.page_size
             )
+        if self.tree_cache.lends_kv:
+            return disabled_l3_layout("L3 storage is not supported with SGLANG_ENABLE_DECOUPLED_HICACHE.", page_size=self.page_size)
 
         from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
             MooncakeStore,

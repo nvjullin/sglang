@@ -138,7 +138,8 @@ class KVCacheService(ABC):
 
     @abstractmethod
     def query(self, keys: Sequence[CacheKey]) -> list[QueryResult]:
-        """Advisory sizes for ranking; no borrow is taken."""
+        """Advisory sizes for ranking; no borrow is taken. A query is a hint
+        that the keys will be acquired soon (the service may keep them warm)."""
 
     @abstractmethod
     def acquire(self, reqs: Sequence[AcquireReq]) -> AcquireBatch:

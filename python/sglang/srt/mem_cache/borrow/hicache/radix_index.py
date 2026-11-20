@@ -99,9 +99,14 @@ class PrefixIndex:
     def _usable_len(self, tokens: Sequence[int]) -> int:
         return len(tokens) // self.page_size * self.page_size
 
-    def peek(self, namespace: tuple, tokens: Sequence[int]) -> tuple[int, int]:
-        """(device_len, cached_len) of the longest cached prefix; no mutation."""
+    def peek(
+        self, namespace: tuple, tokens: Sequence[int], *, touch: bool = False
+    ) -> tuple[int, int]:
+        """(device_len, cached_len) of the longest cached prefix. No structural
+        change; ``touch`` refreshes the recency of fully matched nodes."""
         tokens = tokens[: self._usable_len(tokens)]
+        if touch:
+            self.clock += 1
         node, pos, device_len = self.root, 0, 0
         while pos < len(tokens):
             child = node.children.get(self._child_key(node, namespace, tokens, pos))
@@ -115,6 +120,8 @@ class PrefixIndex:
             pos += common
             if common < len(child.tokens):
                 break
+            if touch:
+                child.last_access = self.clock
             node = child
         return device_len, pos
 

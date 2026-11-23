@@ -154,9 +154,11 @@ def retire_windows_for_decode(batch: ScheduleBatch) -> None:
         )
 
 
-def grow_running_batch(batch: ScheduleBatch, token_per_req: int) -> list[Req]:
+def grow_running_batch(
+    batch: ScheduleBatch, token_per_req: int, *, revoke: bool = True
+) -> Optional[list[Req]]:
     """Borrow the next decode step's positions; returns the requests the cache
-    revoked, which the caller must retract."""
+    revoked, which the caller must retract (None: refused, see `client.grow`)."""
     client = batch.tree_cache.client
     if client.window is not None:
         retire_windows_for_decode(batch)
@@ -169,7 +171,7 @@ def grow_running_batch(batch: ScheduleBatch, token_per_req: int) -> list[Req]:
             reserve=get_alloc_reserve_per_decode(),
             page_size=batch.token_to_kv_pool_allocator.page_size,
         )
-    return client.grow(batch.reqs, ends)
+    return client.grow(batch.reqs, ends, revoke=revoke)
 
 
 def alloc_for_spec_decode(

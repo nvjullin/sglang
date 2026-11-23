@@ -68,7 +68,7 @@ class BorrowPrefillAdder(PrefillAdder):
             and self.can_run_list
             and self.ceil_paged_tokens(extend_len) >= self.rem_input_tokens
         )
-        if (is_chunked and chunked_exists) or over_input_cap:
+        if (is_chunked and chunked_exists) or over_input_cap or not self._delayer_allows():
             self.client.release(req, publish_token_ids=None)
             return AddReqResult.OTHER
         self._commit(req, res, is_chunked=is_chunked)
@@ -87,10 +87,25 @@ class BorrowPrefillAdder(PrefillAdder):
         if res.status != AcquireStatus.GRANTED:
             self.chunked_req_waits = True
             return req
+        # A mid-chunk rank prefills this pass whatever the delayer decides.
+        self._delayer_allows()
         req.extend_end = res.total_len
         self.can_run_list.append(req)
         self._charge(req, prefix_len=0, extend_len=res.total_len - req.prefix_len)
         return req if res.total_len < input_len else None
+
+    def _delayer_allows(self) -> bool:
+        """The prefill delayer's verdict for this pass, negotiated (once per
+        pass, across ranks) when the first candidate fits."""
+        if self.prefill_delayer_single_pass is None:
+            return True
+        return self.prefill_delayer_single_pass.negotiate_should_allow_prefill(
+            local_prefillable=True,
+            running_batch=self.running_batch.batch_size(),
+            max_prefill_bs=self.max_prefill_bs,
+            max_running_requests=self.max_running_requests,
+            waiting_queue_len=self.waiting_queue_len,
+        )
 
     def _commit(self, req: Req, res: AcquireResult, *, is_chunked: bool) -> None:
         req.prefix_len = res.shared_len

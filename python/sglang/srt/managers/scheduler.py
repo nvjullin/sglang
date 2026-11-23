@@ -5184,7 +5184,9 @@ class Scheduler(
             return batch
 
         if self.tree_cache.lends_kv:
-            return self._update_running_batch_lending_kv(batch, initial_bs)
+            return self._update_running_batch_lending_kv(
+                batch, initial_bs, finishing=bool(finishing_reqs)
+            )
 
         if self.uocr_runtime is not None:
             # Retained document windows yield to running requests before retraction.
@@ -5268,13 +5270,21 @@ class Scheduler(
         return batch
 
     def _update_running_batch_lending_kv(
-        self, batch: ScheduleBatch, initial_bs: int
-    ) -> ScheduleBatch:
+        self, batch: ScheduleBatch, initial_bs: int, *, finishing: bool
+    ) -> Optional[ScheduleBatch]:
         """update_running_batch when a cache service lends the KV: it decides
         which requests to retract."""
         from sglang.srt.managers.borrow_cache.scheduling import grow_decode_or_retract
 
-        for req in grow_decode_or_retract(batch, request_retirer=self.request_retirer):
+        # Requests finishing in the in-flight batch free their KV at the end of
+        # this step: if growth does not fit, decode next step instead of revoking.
+        retracted = grow_decode_or_retract(
+            batch, request_retirer=self.request_retirer, revoke=not finishing
+        )
+        if retracted is None:
+            batch.batch_is_full = False
+            return None
+        for req in retracted:
             self._add_request_to_queue(req, is_retracted=True)
         if batch.batch_size() < initial_bs:
             batch.batch_is_full = False

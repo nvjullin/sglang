@@ -72,6 +72,7 @@ def _scheduler(allocator) -> Scheduler:
     scheduler.schedule_stream = None
     scheduler.req_to_token_pool = None
     scheduler.token_to_kv_pool_allocator = SimpleNamespace(storage=_Storage(allocator))
+    scheduler.tree_cache = SimpleNamespace(lends_kv=False)
     return scheduler
 
 

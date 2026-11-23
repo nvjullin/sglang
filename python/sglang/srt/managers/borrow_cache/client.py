@@ -173,16 +173,23 @@ class BorrowCacheClient:
                 view.pending_window_slots.append(res.mut_window_slots)
         return res
 
-    def grow(self, reqs: Sequence[Req], ends: Sequence[int]) -> list[Req]:
+    def grow(
+        self, reqs: Sequence[Req], ends: Sequence[int], *, revoke: bool = True
+    ) -> Optional[list[Req]]:
         """Grow every request's lease to its end; returns the revoked requests,
-        whose leases are already gone."""
+        whose leases are already gone. With ``revoke=False`` a growth that does
+        not fit is refused instead: returns None, nothing granted."""
         views = [self._views[r.rid] for r in reqs]
         batch = self.service.acquire(
             [
-                AcquireReq(end=e, lease=v.lease, attrs=self.attrs_of(r))
+                AcquireReq(end=e, lease=v.lease, attrs=self.attrs_of(r), revoke=revoke)
                 for r, v, e in zip(reqs, views, ends)
             ]
         )
+        self._check_events(batch.events, expected={v.lease for v in views})
+        if not revoke and any(r.status == AcquireStatus.REFUSED for r in batch.results):
+            assert all(r.status == AcquireStatus.REFUSED for r in batch.results)
+            return None
         revoked = []
         for req, view, res in zip(reqs, views, batch.results):
             if res.status == AcquireStatus.REVOKED:
@@ -201,7 +208,6 @@ class BorrowCacheClient:
                 view.pending_slots.append(res.mut_slots)
                 if self.window is not None:
                     view.pending_window_slots.append(res.mut_window_slots)
-        self._check_events(batch.events, expected={v.lease for v in views})
         return revoked
 
     def _acquire_one(self, req: AcquireReq) -> AcquireResult:

@@ -309,6 +309,29 @@ class TestGrowth(unittest.TestCase):
         check_accounting(svc)
         check_exclusive_mut(svc)
 
+    def test_decode_shortfall_without_revoke_refuses_all(self):
+        """With revoke=False, a decode growth that does not fit is refused as a
+        whole: nothing is granted or revoked. It fits once a lease ends."""
+        svc, rt = make(page_size=1, device_pages=24, with_host=False)
+        reqs = [FakeReq(i, [i * 10 + j for j in range(7)], max_new=100) for i in range(3)]
+        svc.new_token_ratio = 0.0
+        for r in reqs:
+            self.assertTrue(rt.open(r))
+        rt.forward(reqs)
+        alive = rt.decode(reqs)  # 3 * 8 = 24 slots: the pool is full.
+        rt.forward(alive)
+        self.assertIsNone(rt.decode(alive, revoke=False))
+        self.assertEqual(rt.revoked, [])
+        self.assertEqual([len(r.slots) for r in reqs], [8, 8, 8])
+        check_accounting(svc)
+        rt.finish(reqs[0])
+        alive = rt.decode(reqs[1:], revoke=False)
+        self.assertEqual([len(r.slots) for r in alive], [9, 9])
+        self.assertEqual(rt.revoked, [])
+        rt.forward(alive)
+        check_accounting(svc)
+        check_exclusive_mut(svc)
+
     def test_growth_to_a_covered_end_keeps_the_lease(self):
         """Spec decoding reserves ahead: a step whose end the lease already
         covers grants nothing and must not shrink the lease."""

@@ -50,6 +50,7 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_memory,
     get_parallel,
+    get_schedule,
     mamba_checkpoint_grid,
 )
 from sglang.srt.speculative.base_spec_worker import HiCacheDraftMode, HiCacheDraftPlan
@@ -64,8 +65,9 @@ def _unsupported(
     allocator: Any,
     spec_algorithm: Any,
     draft_mode: HiCacheDraftMode,
+    disable_radix_cache: bool,
 ) -> list[str]:
-    memory, parallel = get_memory(), get_parallel()
+    memory, parallel, schedule = get_memory(), get_parallel(), get_schedule()
     state = allocator.state
     table = HybridReqToTokenPool if state is not None else ReqToTokenPool
     kv_pool = allocator.get_kvcache()
@@ -95,6 +97,16 @@ def _unsupported(
         "encoder-decoder models": model_config.is_encoder_decoder,
         "unified memory": memory.enable_unified_memory,
         "session radix cache": memory.enable_session_radix_cache,
+        # The service always shares prefixes; a disabled radix cache (explicit,
+        # or forced by the model, e.g. noncausal or prefix-LM attention) must not.
+        "a disabled radix cache": disable_radix_cache,
+        # Mixed steps decode without growing the leases.
+        "--enable-mixed-chunk": schedule.enable_mixed_chunk,
+        # The service picks revocation victims without priorities.
+        "--retraction-policy priority": schedule.retraction_policy == "priority",
+        "priority preemption (--enable-priority-scheduling without "
+        "--disable-priority-preemption)": schedule.enable_priority_scheduling
+        and not schedule.disable_priority_preemption,
         "HiCache storage (L3)": bool(memory.hicache_storage_backend),
         "--hicache-write-policy other than write_through": memory.hicache_write_policy
         != "write_through",
@@ -286,6 +298,7 @@ def build_borrow_tree_facade(
     spec_algorithm: Any,
     draft_plan: Optional[HiCacheDraftPlan],
     swa_retain_window: Optional[int],
+    disable_radix_cache: bool,
 ) -> BorrowTreeFacade:
     kv_pool = token_to_kv_pool_allocator.get_kvcache()
     draft_plan = draft_plan or HiCacheDraftPlan()
@@ -295,6 +308,7 @@ def build_borrow_tree_facade(
         allocator=token_to_kv_pool_allocator,
         spec_algorithm=spec_algorithm,
         draft_mode=draft_plan.mode,
+        disable_radix_cache=disable_radix_cache,
     ):
         raise ValueError(
             "SGLANG_ENABLE_DECOUPLED_HICACHE does not support: " + ", ".join(bad)

@@ -565,9 +565,11 @@ class HiCacheService(KVCacheService):
     def _grow_all(
         self, reqs: Sequence[AcquireReq], idx: list[int], results: list
     ) -> None:
-        """Decode-phase growth must succeed: revoke leases until it fits."""
+        """Decode-phase growth: revoke leases until it fits, or refuse it all
+        when a request asks not to revoke."""
         live = list(idx)
         need = {i: self._grow_pages(self.leases[reqs[i].lease], reqs[i].end) for i in live}
+        may_revoke = all(reqs[i].revoke for i in idx)
         pages = windows = None
         while live:
             total = sum(need[i] for i in live)
@@ -579,6 +581,17 @@ class HiCacheService(KVCacheService):
                     windows = [] if self.win is None else self.win.take(total)
                     assert windows is not None
                     break
+            if not may_revoke:
+                self.counters["refused"] += len(idx)
+                for i in idx:
+                    lease = self.leases[reqs[i].lease]
+                    results[i] = AcquireResult(
+                        status=AcquireStatus.REFUSED,
+                        lease=lease.id,
+                        shared_len=lease.shared_len,
+                        total_len=lease.total_len,
+                    )
+                return
             victim = min(live, key=lambda i: self._victim_key(self.leases[reqs[i].lease]))
             live.remove(victim)
             results[victim] = self._revoke(self.leases[reqs[victim].lease])

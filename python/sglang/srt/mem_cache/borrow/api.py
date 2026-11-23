@@ -67,6 +67,11 @@ class AcquireReq(msgspec.Struct, frozen=True):
     least ``min_mut_len`` (``None``: all of what ``end`` and ``max_mut_len``
     allow). A span the service cuts short ends on a page boundary that is also
     a multiple of ``cut_align``. Otherwise the request is refused.
+
+    Decode-phase growth (a lease past its prompt) is all of ``end``; when the
+    growths of one call do not all fit, the service revokes leases until they
+    do. If any of them has ``revoke=False`` (the runtime expects memory back
+    within a step), it refuses them all instead.
     """
 
     end: int
@@ -76,6 +81,7 @@ class AcquireReq(msgspec.Struct, frozen=True):
     min_mut_len: Optional[int] = None
     cut_align: Optional[int] = None
     attrs: LeaseAttrs = LeaseAttrs()
+    revoke: bool = True
 
 
 class StateGrant(msgspec.Struct, frozen=True):

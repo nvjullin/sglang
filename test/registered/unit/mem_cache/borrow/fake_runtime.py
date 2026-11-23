@@ -347,14 +347,24 @@ class FakeRuntime:
             req.lease, req.tokens[: req.computed], state=self._anchor(req)
         )
 
-    def decode(self, reqs: Sequence[FakeReq], *, k: int = 1) -> list[FakeReq]:
-        """Grow every request by k positions; returns the survivors."""
+    def decode(
+        self, reqs: Sequence[FakeReq], *, k: int = 1, revoke: bool = True
+    ) -> Optional[list[FakeReq]]:
+        """Grow every request by k positions; returns the survivors (None: the
+        service refused the growth)."""
         batch = self.svc.acquire(
             [
-                AcquireReq(end=len(r.slots) + k, lease=r.lease, attrs=self.attrs(r))
+                AcquireReq(
+                    end=len(r.slots) + k, lease=r.lease, attrs=self.attrs(r), revoke=revoke
+                )
                 for r in reqs
             ]
         )
+        if any(res.status == AcquireStatus.REFUSED for res in batch.results):
+            assert not revoke
+            assert all(res.status == AcquireStatus.REFUSED for res in batch.results)
+            assert not batch.events
+            return None
         alive = []
         for r, res in zip(reqs, batch.results):
             if res.status == AcquireStatus.REVOKED:

@@ -76,6 +76,15 @@ _OWNER_SITES = {
     ("mem_cache/allocation.py", "alloc_for_extend", "set_row_len"): 1,
     ("mem_cache/allocation.py", "alloc_for_decode_default", "evict"): 1,
     ("mem_cache/allocation.py", "alloc_for_decode_default", "allocate_decode"): 1,
+    # With a cache service lending the KV (SGLANG_ENABLE_DECOUPLED_HICACHE), the
+    # allocation.py functions return into these instead of running their own body.
+    ("managers/borrow_cache/kv_ops.py", "alloc_for_extend", "set_row_len"): 1,
+    ("managers/borrow_cache/kv_ops.py", "alloc_for_decode", "allocate_decode"): 1,
+    (
+        "managers/borrow_cache/kv_ops.py",
+        "alloc_for_spec_decode",
+        "allocate_spec_decode",
+    ): 1,
     # spec v2: no pre-claim; resolve commits the full accepted run uniformly.
     # kv_allocated_len for spec v2 draft decode (eagle + dflash) is settled
     # inside the owned-kv alloc_for_spec_decode function (op42).

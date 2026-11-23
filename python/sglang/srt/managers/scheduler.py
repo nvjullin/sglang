@@ -346,7 +346,6 @@ from sglang.srt.managers.utils import (
 )
 from sglang.srt.mem_cache import kv_cache_builder
 from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
-from sglang.srt.mem_cache.base_prefix_cache import lends_kv
 from sglang.srt.mem_cache.capacity import shares_memory
 from sglang.srt.mem_cache.common import checkpoint_kv_cache, storage_prefetch_end
 from sglang.srt.mem_cache.events import KvEventLoraNames
@@ -502,6 +501,13 @@ _is_npu = is_npu()
 _is_hip = is_hip()
 
 
+def _cache_lends_kv() -> bool:
+    """Whether a cache service lends the KV slots (`lends_kv` of the tree
+    cache it builds). Read from the flag, not the scheduler: stub schedulers in
+    tests carry neither the tree cache nor a default."""
+    return envs.SGLANG_ENABLE_DECOUPLED_HICACHE.get()
+
+
 class Scheduler(
     SchedulerDisaggregationDecodeMixin,
     SchedulerDisaggregationPrefillMixin,
@@ -526,9 +532,6 @@ class Scheduler(
     # Unlimited-OCR collaborators; None for every other model.
     uocr_runtime: Optional[UocrSchedulerRuntime] = None
     resolve_forward_inputs = staticmethod(resolve_forward_inputs)
-    # Whether a cache service lends the KV slots (`lends_kv`); a class-level
-    # default, so stub schedulers built via __new__ take the default paths.
-    cache_lends_kv: bool = False
     # Class-level defaults so stub schedulers built via __new__ skip the log.
     log_schedule_decisions: bool = False
     _last_empty_schedule_decision: Optional[Tuple[int, ...]] = None
@@ -684,7 +687,6 @@ class Scheduler(
         )
         self.disable_radix_cache = result.disable_radix_cache
         self.tree_cache = result.tree_cache
-        self.cache_lends_kv = lends_kv(self.tree_cache)
         if self.enable_hierarchical_cache:
             cache_controller = self.tree_cache.cache_controller
             if cache_controller is not None:
@@ -2696,7 +2698,7 @@ class Scheduler(
         return False
 
     def get_prefill_adder_class(self) -> type[PrefillAdder]:
-        if self.cache_lends_kv:
+        if _cache_lends_kv():
             from sglang.srt.managers.borrow_cache.adder import BorrowPrefillAdder
 
             return BorrowPrefillAdder
@@ -5188,7 +5190,7 @@ class Scheduler(
             batch.batch_is_full = False
             return batch
 
-        if self.cache_lends_kv:
+        if _cache_lends_kv():
             return self._update_running_batch_lending_kv(
                 batch, initial_bs, finishing=bool(finishing_reqs)
             )
@@ -5406,7 +5408,7 @@ class Scheduler(
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
         """Run a batch."""
-        if not self.cache_lends_kv:
+        if not _cache_lends_kv():
             return self._run_batch(batch, pp_proxy_tensors)
         from sglang.srt.managers.borrow_cache import scheduling as kv_lending
 
@@ -6086,7 +6088,7 @@ class Scheduler(
         return self.external_corpus_manager.list(recv_req)
 
     def clear_hicache_storage_wrapped(self, recv_req: ClearHiCacheReqInput):
-        if self.cache_lends_kv:
+        if _cache_lends_kv():
             return ClearHiCacheReqOutput(success=False)
         if self.enable_hierarchical_cache or self.enable_lmcache:
             self.tree_cache.clear_storage_backend()
@@ -6239,7 +6241,7 @@ class Scheduler(
             # HiCache: in-flight async ops (GPU↔Host↔L3) must drain before
             # destructive operations like attach/detach/flush_cache. A cache
             # service drains its own copies.
-            if self.enable_hierarchical_cache and not self.cache_lends_kv:
+            if self.enable_hierarchical_cache and not _cache_lends_kv():
                 tc = self.tree_cache
                 idle &= len(tc.ongoing_write_through) == 0
                 idle &= len(tc.ongoing_load_back) == 0
@@ -6273,7 +6275,7 @@ class Scheduler(
             return AttachHiCacheStorageReqOutput(
                 success=False, message="Hierarchical cache is not enabled."
             )
-        if self.cache_lends_kv:
+        if _cache_lends_kv():
             return AttachHiCacheStorageReqOutput(success=False, message="L3 storage is not supported with SGLANG_ENABLE_DECOUPLED_HICACHE.")
 
         if not self.is_fully_idle():
@@ -6331,7 +6333,7 @@ class Scheduler(
             return DetachHiCacheStorageReqOutput(
                 success=False, message="Hierarchical cache is not enabled."
             )
-        if self.cache_lends_kv:
+        if _cache_lends_kv():
             return DetachHiCacheStorageReqOutput(success=False, message="L3 storage is not supported with SGLANG_ENABLE_DECOUPLED_HICACHE.")
 
         if not self.is_fully_idle():
@@ -6392,7 +6394,7 @@ class Scheduler(
             self.tree_cache.reset()
             self.req_to_token_pool.clear()
             self.token_to_kv_pool_allocator.clear()
-            if self.cache_lends_kv:
+            if _cache_lends_kv():
                 self.tree_cache.bind_pool_tables()
             self.req_to_token_pool.reset_aux_cache_allocator()
             self.grammar_manager.clear()
@@ -6431,7 +6433,7 @@ class Scheduler(
             return disabled_l3_layout(
                 "Hierarchical cache is disabled", page_size=self.page_size
             )
-        if self.cache_lends_kv:
+        if _cache_lends_kv():
             return disabled_l3_layout("L3 storage is not supported with SGLANG_ENABLE_DECOUPLED_HICACHE.", page_size=self.page_size)
 
         from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (

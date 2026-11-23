@@ -180,10 +180,13 @@ class CacheStats(msgspec.Struct, frozen=True):
     state_slots: int = 0
     state_free_slots: int = 0
     cached_states: int = 0
+    host_state_slots: int = 0
+    host_state_free_slots: int = 0
     # Window pages (0 without a window pool).
     window_pages: int = 0
     window_free_pages: int = 0
     cached_window_pages: int = 0
+    evictable_window_pages: int = 0
     counters: dict = {}
 
 

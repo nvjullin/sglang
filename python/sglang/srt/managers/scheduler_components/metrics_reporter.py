@@ -17,6 +17,7 @@ from sglang.srt.eplb.expert_distribution import EPLB_BALANCEDNESS_WINDOW_SIZES
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler_components.request_list import ListKind
 from sglang.srt.managers.utils import GenerationBatchResult
+from sglang.srt.mem_cache.base_prefix_cache import lends_kv
 from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.observability.forward_pass_metrics import (
@@ -1212,10 +1213,16 @@ class SchedulerMetricsReporter:
         """
         if not self.scheduler.enable_hierarchical_cache:
             return
-        if self.scheduler.tree_cache.lends_kv:
+        if lends_kv(self.scheduler.tree_cache):
             used, total = self.scheduler.tree_cache.host_tier_usage()
             self.stats.hicache_host_used_tokens = used
             self.stats.hicache_host_total_tokens = total
+            states = self.scheduler.tree_cache.host_state_usage()
+            if states is not None:
+                (
+                    self.stats.hicache_host_mamba_used_states,
+                    self.stats.hicache_host_mamba_total_states,
+                ) = states
             return
 
         host_pool = getattr(

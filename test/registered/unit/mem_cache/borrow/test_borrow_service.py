@@ -44,7 +44,7 @@ def make(page_size=4, device_pages=32, host_pages=64, with_host=True):
         config=ServiceConfig(page_size=page_size, num_device_pages=device_pages),
         data_plane=dp,
     )
-    return svc, FakeRuntime(svc, kv)
+    return svc, FakeRuntime(svc, kv, data_plane=dp)
 
 
 def make_state(
@@ -76,7 +76,7 @@ def make_state(
         ),
     )
     svc = HiCacheService(config=cfg, data_plane=dp, state_plane=sp)
-    return svc, FakeRuntime(svc, kv, state=sp, checkpoint_grid=grid)
+    return svc, FakeRuntime(svc, kv, state=sp, checkpoint_grid=grid, data_plane=dp)
 
 
 def make_window(
@@ -87,6 +87,7 @@ def make_window(
     host_windows=32,
     window=8,
     with_host=True,
+    lazy_backups=True,
 ):
     kv = np.full((device_pages + 1) * page_size, -1, dtype=np.int64)
     wkv = np.full((window_pages + 1) * page_size, -1, dtype=np.int64)
@@ -97,6 +98,7 @@ def make_window(
             device_kv=kv,
             device_window_kv=wkv,
             host_num_window_pages=host_windows,
+            lazy_backups=lazy_backups,
         )
         if with_host
         else None
@@ -107,7 +109,9 @@ def make_window(
         window=WindowConfig(num_pages=window_pages, window_tokens=window, retire_interval=4),
     )
     svc = HiCacheService(config=cfg, data_plane=dp)
-    rt = FakeRuntime(svc, kv, window_kv=wkv, window_tokens=window, page_size=page_size)
+    rt = FakeRuntime(
+        svc, kv, window_kv=wkv, window_tokens=window, page_size=page_size, data_plane=dp
+    )
     return svc, rt
 
 
@@ -125,7 +129,7 @@ def check_window_accounting(svc: HiCacheService) -> None:
     assert svc.win.alloc.num_free + len(private) + len(cached) == svc.cfg.window.num_pages
     assert set(pinned) <= set(cached), "a lease pins an uncached window page"
     counts = {}
-    for w in pinned:
+    for w in pinned + svc._load_window_pins:
         counts[w] = counts.get(w, 0) + 1
     assert counts == index._window_pins
 
@@ -235,6 +239,41 @@ class TestTiers(unittest.TestCase):
         fence = rt.forward([b])
         self.assertIsNotNone(fence)
         check_accounting(svc)
+
+    def _host_only_prefix(self, rt):
+        """Cache a 16-token prefix, then demote it to the host tier."""
+        a = FakeReq(1, list(range(1, 18)), max_new=0)
+        rt.open(a)
+        rt.forward([a])
+        rt.finish(a)
+        filler = FakeReq(2, list(range(100, 130)), max_new=0)
+        self.assertTrue(rt.open(filler))
+        rt.forward([filler])
+        rt.finish(filler)
+        return a
+
+    def test_lease_ended_before_its_batch_launches_its_load(self):
+        """A lease that ends before any batch (admission undone) does not
+        strand its load: the loaded pages can be evicted for the next lease,
+        whose forward waits on that load."""
+        svc, rt = make(page_size=4, device_pages=8, host_pages=32)
+        a = self._host_only_prefix(rt)
+        b = FakeReq(3, list(a.prompt), max_new=0)
+        self.assertTrue(rt.open(b))
+        self.assertEqual(svc.counters["loaded_tokens"], 16)
+        rt.finish(b, publish=False)
+        whole = FakeReq(4, list(range(200, 232)), max_new=0)
+        self.assertTrue(rt.open(whole))  # All 8 pages, the loaded ones included.
+        self.assertIsNotNone(rt.forward([whole]))
+        check_accounting(svc)
+
+    def test_flush_after_a_lease_ended_before_its_batch(self):
+        svc, rt = make(page_size=4, device_pages=8, host_pages=32)
+        a = self._host_only_prefix(rt)
+        b = FakeReq(3, list(a.prompt), max_new=0)
+        self.assertTrue(rt.open(b))
+        rt.finish(b, publish=False)
+        self.assertTrue(svc.flush())
 
     def test_load_falls_back_to_recompute_when_it_does_not_fit(self):
         svc, rt = make(page_size=1, device_pages=6, host_pages=32)
@@ -615,6 +654,53 @@ class TestSlidingWindow(unittest.TestCase):
         hit = FakeReq(4, a.prompt[:24] + [9], max_new=0)
         self.assertTrue(rt.open(hit))
         self.assertEqual(hit.computed, 24)
+        rt.forward([hit])
+        check_window_accounting(svc)
+
+    def test_window_eviction_waits_for_the_backup_reading_it(self):
+        """A published window page is reused only after the backup copying it
+        finished, so its host copy, loaded back later, holds its own KV."""
+        svc, rt = make_window(
+            page_size=4, device_pages=15, window_pages=13, host_pages=64, host_windows=32, window=8
+        )
+        a = FakeReq(1, list(range(1, 34)), max_new=0)
+        self._run(rt, a)
+        rt.finish(a)  # Backs up a's 8 cached pages and their window pages.
+        # b needs 7 window pages, 5 are free: a's first two are tombstoned.
+        b = FakeReq(2, list(range(100, 125)), max_new=0)
+        self._run(rt, b)
+        rt.finish(b)
+        # d's KV pages evict a's, so a's prefix is host-only.
+        d = FakeReq(3, list(range(200, 217)), max_new=0)
+        self._run(rt, d)
+        rt.finish(d)
+        # A hit ending at 8 reads the window KV of a's first two pages.
+        c = FakeReq(4, a.prompt[:8] + [7], max_new=0)
+        self.assertTrue(rt.open(c))
+        self.assertEqual(c.computed, 8)
+        self.assertEqual(svc.counters["loaded_tokens"], 8)
+        rt.forward([c])
+        check_window_accounting(svc)
+
+    def test_queued_load_keeps_its_host_window_pages(self):
+        """Host window pages a queued load reads are not reused by a backup
+        before the load launches."""
+        svc, rt = make_window(
+            page_size=4, device_pages=8, host_pages=32, host_windows=5, window=8,
+            lazy_backups=False,
+        )
+        a = FakeReq(1, list(range(1, 18)), max_new=0)
+        self._run(rt, a)
+        rt.finish(a)  # 4 of the 5 host window pages.
+        filler = FakeReq(2, list(range(100, 124)), max_new=0)
+        self._run(rt, filler)  # Evicts a's KV: a is host-only.
+        rt.finish(filler, publish=False)
+        other = FakeReq(3, list(range(200, 209)), max_new=0)
+        self._run(rt, other)
+        hit = FakeReq(4, list(a.prompt), max_new=0)
+        self.assertTrue(rt.open(hit))
+        self.assertEqual(hit.computed, 16)
+        rt.publish(other)  # Backs up 2 window pages; 1 host page is free.
         rt.forward([hit])
         check_window_accounting(svc)
 

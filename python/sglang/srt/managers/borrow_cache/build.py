@@ -21,7 +21,7 @@ from sglang.srt.mem_cache.borrow.hicache.service import (
     StateConfig,
 )
 from sglang.srt.mem_cache.hybrid_cache.host_pool_config import prepare_host_pool_config
-from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator, is_swa_req_ring
 from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
     _make_layer_mapper,
     _state_host_layout,
@@ -78,6 +78,8 @@ def _unsupported(
             kv_pool, BaseSWAKVPool
         )
         and type(allocator) is not SWATokenToKVPoolAllocator,
+        # Ring storage addresses window KV by request row, not by the service's pages.
+        "per-request ring sliding-window storage": is_swa_req_ring(allocator),
         "encoder SWA bounded replay": get_exec().features.enable_encoder_swa_bounded_replay,
         "decoder SWA bounded replay outside DeepSeek V4 pools": bool(
             get_exec().features.enable_decoder_swa_bounded_replay

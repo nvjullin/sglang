@@ -24,6 +24,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     EvictResult,
     MatchPrefixParams,
     MatchResult,
+    lends_kv,
     zero_match_result,
 )
 from sglang.srt.mem_cache.hicache_storage import PoolTransfer
@@ -238,7 +239,7 @@ def checkpoint_kv_cache(req: Req, tree_cache: BasePrefixCache) -> None:
     # The tree reads req.finished() to tell a checkpoint from the final
     # insert; a finished request belongs in release_kv_cache.
     assert not req.finished(), f"checkpointing finished request {req.rid}"
-    if tree_cache.lends_kv:
+    if lends_kv(tree_cache):
         from sglang.srt.managers.borrow_cache import kv_ops
 
         return kv_ops.checkpoint_kv_cache(req, tree_cache)
@@ -389,7 +390,7 @@ def discard_kv_cache_backup(req: Req, tree_cache: BasePrefixCache) -> None:
 def release_kv_cache(req: Req, tree_cache: BasePrefixCache, *, checkpoint: bool):
     """Give the request's kv row back; with ``checkpoint`` the tree first keeps
     what it can key."""
-    if tree_cache.lends_kv:
+    if lends_kv(tree_cache):
         from sglang.srt.managers.borrow_cache import kv_ops
 
         return kv_ops.release_kv_cache(req, tree_cache, checkpoint=checkpoint)

@@ -75,6 +75,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     InitLoadBackParams,
     InsertParams,
     MatchPrefixParams,
+    lends_kv,
     zero_match_result,
 )
 from sglang.srt.mem_cache.capacity import capacity_decision, create_prefill_budget
@@ -520,7 +521,7 @@ class SchedulePolicy:
             not in ("lru", "joint_lru", "state_cost")
             or self.tree_cache.supports_fast_match_prefix()
             or not (
-                self.tree_cache.supports_prefix_sharing() or self.tree_cache.lends_kv
+                self.tree_cache.supports_prefix_sharing() or lends_kv(self.tree_cache)
             )
         ):
             return

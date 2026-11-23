@@ -145,6 +145,12 @@ class HiCacheService(KVCacheService):
         self.leases: dict[int, Lease] = {}
         self._next_lease = 1
         self._latest_done: Any = None
+        # Loads are queued by opens and launched by begin_batch, or by _end when
+        # a lease ends first; _early_loads is the fence of the latter, which the
+        # next forward waits on. Queued loads' window destinations stay pinned.
+        self._loads_queued = False
+        self._early_loads: Optional[Fence] = None
+        self._load_window_pins: list[int] = []
         self._events: list = []
         self.new_token_ratio = config.init_new_token_ratio
         self.counters = dict(
@@ -320,7 +326,13 @@ class HiCacheService(KVCacheService):
         return events
 
     def begin_batch(self, batch_id: int, leases: Sequence[int]) -> Optional[Fence]:
-        fence = None if self.dp is None else self.dp.launch_loads(after=self._latest_done)
+        fence = None
+        if self.dp is not None:
+            # Loads finish in launch order, so a new fence covers earlier ones.
+            fence = self._launch_loads()
+            if fence is None:
+                fence = self._early_loads
+            self._early_loads = None
         if self.sp is None:
             return fence
         event = self.sp.fence_event(also_after=None if fence is None else fence.final_event)
@@ -332,6 +344,14 @@ class HiCacheService(KVCacheService):
     def end_batch(self, batch_id: int, done_event: Any) -> list:
         self._latest_done = done_event
         return []
+
+    def _launch_loads(self) -> Optional[Fence]:
+        """Launch the queued loads after the latest forward."""
+        fence = self.dp.launch_loads(after=self._latest_done)
+        self._loads_queued = False
+        self.index.unpin_windows(self._load_window_pins)
+        self._load_window_pins = []
+        return fence
 
     # ===== Open / grow =====
 
@@ -506,6 +526,9 @@ class HiCacheService(KVCacheService):
             host_w = [w for n in nodes for w in self.index.live_windows(n.host_window_pages)]
             dev_w = self.win.take(len(host_w))
             assert dev_w is not None, "window headroom check admitted an unloadable prefix"
+            # Until launch, the load writes them: no eviction may reuse them.
+            self.index.pin_windows(dev_w)
+            self._load_window_pins.extend(dev_w)
             windows, it = (host_w, dev_w), iter(dev_w)
             node_windows = [
                 None
@@ -514,6 +537,7 @@ class HiCacheService(KVCacheService):
                 for n in nodes
             ]
         op = self.dp.queue_load(host_pages, pages, windows=windows)
+        self._loads_queued = True
         start = 0
         for n, wp in zip(nodes, node_windows):
             k = len(n.host_pages)
@@ -745,6 +769,12 @@ class HiCacheService(KVCacheService):
         if self.win is not None:
             self.win.end(lease)
         del self.leases[lease.id]
+        if self._loads_queued:
+            # A lease ended before its batch (e.g. admission undone): no batch may
+            # launch its load, whose pages the index already counts as evictable.
+            fence = self._launch_loads()
+            if fence is not None:
+                self._early_loads = fence
 
     # ===== Control plane =====
 
@@ -763,15 +793,20 @@ class HiCacheService(KVCacheService):
             state_slots=0 if self.states is None else self.states.num_pages,
             state_free_slots=0 if self.states is None else self.states.num_free,
             cached_states=self.index.num_states,
+            host_state_slots=0 if self.sp is None else self.sp.host_num_slots,
+            host_state_free_slots=0 if self.sp is None else self.sp.host_num_free(),
             window_pages=0 if self.win is None else self.win.alloc.num_pages,
             window_free_pages=0 if self.win is None else self.win.alloc.num_free,
             cached_window_pages=self.index.window_pages_cached,
+            evictable_window_pages=self.index.evictable_window_pages,
             counters=dict(self.counters),
         )
 
     def flush(self) -> bool:
         if self.leases:
             return False
+        assert not self._loads_queued, "loads queued with no lease open"
+        self._early_loads = None
         device, host = self.index.drop_all()
         self.device.free(device.pages)
         if self.dp is not None:

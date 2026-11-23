@@ -3,14 +3,16 @@
 KV content of position ``p`` of a sequence is a function of the namespace and
 tokens ``[0, p]``, like real KV. The fake data plane copies contents between a
 device array and a host array, so tests can check that every slot a lease
-borrows holds the KV its position needs. Recurrent state after ``n`` tokens is
+borrows holds the KV its position needs. A backup copies only when waited on
+or after the next forward wrote (a D2H overlapping that forward, the latest a
+real one can run), so reusing its source pages without a wait shows up. Recurrent state after ``n`` tokens is
 likewise a function of the namespace and tokens ``[0, n)``.
 """
 
 from __future__ import annotations
 
 import random
-from typing import Any, Optional, Sequence
+from typing import Any, Callable, Optional, Sequence
 
 import numpy as np
 
@@ -42,13 +44,20 @@ def state_content(namespace: tuple, tokens: Sequence[int], length: int) -> int:
 
 
 class FakeOp(TransferOp):
-    def __init__(self, launched: bool):
+    def __init__(self, launched: bool, copy: Optional[Callable[[], None]] = None):
         self.launched = launched
         self.waits = 0
+        self._copy = copy
 
     def wait(self) -> None:
         assert self.launched, "waiting on a copy that never launched"
         self.waits += 1
+        self.settle()
+
+    def settle(self) -> None:
+        if self._copy is not None:
+            copy, self._copy = self._copy, None
+            copy()
 
 
 class FakeDataPlane(DataPlane):
@@ -60,8 +69,12 @@ class FakeDataPlane(DataPlane):
         device_kv: np.ndarray,
         device_window_kv: Optional[np.ndarray] = None,
         host_num_window_pages: int = 0,
+        lazy_backups: bool = True,
     ):
         self.page_size = page_size
+        # False: a backup copies at once, before a load launched later (a D2H
+        # and an H2D after the same forward run in either order).
+        self.lazy_backups = lazy_backups
         self.host_num_pages = host_num_pages
         self._host = PageAllocator(num_pages=host_num_pages)
         self.device_kv = device_kv
@@ -71,6 +84,7 @@ class FakeDataPlane(DataPlane):
         self._host_windows = PageAllocator(num_pages=host_num_window_pages)
         self.host_window_kv = np.full(max(host_num_window_pages, 1) * page_size, -1, dtype=np.int64)
         self._queued: list = []
+        self._backups: list[FakeOp] = []
         self.launches = 0
 
     def _slots(self, pages: Sequence[int]) -> np.ndarray:
@@ -96,11 +110,28 @@ class FakeDataPlane(DataPlane):
         self._host_windows.free(pages)
 
     def backup(self, device_pages, host_pages, *, after: Any, windows=None) -> TransferOp:
-        self.host_kv[self._slots(host_pages)] = self.device_kv[self._slots(device_pages)]
+        dev, host = self._slots(device_pages), self._slots(host_pages)
+        dev_w = host_w = None
         if windows is not None and windows[0]:
-            dev_w, host_w = windows
-            self.host_window_kv[self._slots(host_w)] = self.device_window_kv[self._slots(dev_w)]
-        return FakeOp(launched=True)
+            dev_w, host_w = self._slots(windows[0]), self._slots(windows[1])
+
+        def copy() -> None:
+            self.host_kv[host] = self.device_kv[dev]
+            if dev_w is not None:
+                self.host_window_kv[host_w] = self.device_window_kv[dev_w]
+
+        op = FakeOp(launched=True, copy=copy)
+        if self.lazy_backups:
+            self._backups.append(op)
+        else:
+            op.settle()
+        return op
+
+    def settle_backups(self) -> None:
+        """Run the pending backups (the forward after their launch is done)."""
+        for op in self._backups:
+            op.settle()
+        self._backups = []
 
     def queue_load(self, host_pages, device_pages, windows=None) -> TransferOp:
         op = FakeOp(launched=False)
@@ -213,8 +244,10 @@ class FakeRuntime:
         window_kv: Optional[np.ndarray] = None,
         window_tokens: int = 0,
         page_size: int = 1,
+        data_plane: Optional[FakeDataPlane] = None,
     ):
         self.svc = service
+        self.dp = data_plane
         self.kv = device_kv
         self.state = state
         self.grid = checkpoint_grid
@@ -297,6 +330,8 @@ class FakeRuntime:
             if self.state is not None:
                 self._advance_state(r, toks, len(r.slots))
             r.computed = len(r.slots)
+        if self.dp is not None:
+            self.dp.settle_backups()
         self.svc.end_batch(self.batch_id, done_event=None)
         return fence
 

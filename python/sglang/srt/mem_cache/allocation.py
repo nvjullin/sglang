@@ -27,7 +27,7 @@ from sglang.srt.layers.cp.utils import (
     get_cp_sharded_padded_allocation_size,
     get_cp_sharded_padded_cache_transfer_indices,
 )
-from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
+from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, lends_kv
 from sglang.srt.mem_cache.capacity import capacity_decision
 from sglang.srt.mem_cache.common import (
     available_and_evictable_str,
@@ -370,7 +370,7 @@ def alloc_for_extend(
     (the last is the host/CPU mirror). ``alloc_req_slots`` raises ``RuntimeError``
     if the pool can't satisfy the batch (fail-loud — see its docstring).
     """
-    if batch.tree_cache.lends_kv:
+    if lends_kv(batch.tree_cache):
         from sglang.srt.managers.borrow_cache import kv_ops
 
         return kv_ops.alloc_for_extend(batch)
@@ -804,7 +804,7 @@ ALLOC_FOR_DECODE_FUNCS = defaultdict(lambda: alloc_for_decode_default)
 
 
 def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
-    if batch.tree_cache.lends_kv:
+    if lends_kv(batch.tree_cache):
         from sglang.srt.managers.borrow_cache import kv_ops
 
         return kv_ops.alloc_for_decode(batch, token_per_req)
@@ -871,7 +871,7 @@ def alloc_for_spec_decode(
     num_needed_tokens: int,
     batch: Optional[ScheduleBatch] = None,
 ) -> None:
-    if tree_cache.lends_kv:
+    if lends_kv(tree_cache):
         from sglang.srt.managers.borrow_cache import kv_ops
 
         return kv_ops.alloc_for_spec_decode(

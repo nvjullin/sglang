@@ -74,7 +74,9 @@ class DataPlane(ABC):
     def launch_loads(self, *, after: Any) -> Optional[Fence]:
         """Launch every queued load after the event ``after``; None if none queued.
 
-        Every per-layer completion is enqueued before this returns.
+        Every per-layer completion is enqueued before this returns. Launches
+        complete in order: a fence's final event also follows every load
+        launched before it.
         """
 
     @abstractmethod

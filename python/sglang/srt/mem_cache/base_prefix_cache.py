@@ -488,9 +488,6 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     storage_prefetch_retries: Optional[StoragePrefetchRetries] = None
     # Set by caches that publish KV placement events; None means they don't.
     kv_events: Optional[KVCacheEventRecorder] = None
-    # True when a cache service lends the KV slots (SGLANG_ENABLE_DECOUPLED_HICACHE):
-    # rows and slots then move only through sglang.srt.managers.borrow_cache.
-    lends_kv: bool = False
 
     def init_metrics_collector(self):
         from sglang.srt.layers.dp_attention import is_dp_attention_enabled
@@ -943,3 +940,14 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
             available_size = from_cp_sharded(available_size)
         evictable_size = self.evictable_size()
         return f"Available tokens: {available_size + evictable_size} ({available_size=} + {evictable_size=})\n"
+
+
+class LendingPrefixCache(BasePrefixCache):
+    """A prefix cache over KV slots a cache service lends
+    (SGLANG_ENABLE_DECOUPLED_HICACHE): rows and slots then move only through
+    sglang.srt.managers.borrow_cache."""
+
+
+def lends_kv(tree_cache: Any) -> bool:
+    # A type check, not an attribute: a test double of another cache never matches.
+    return isinstance(tree_cache, LendingPrefixCache)

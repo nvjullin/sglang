@@ -554,7 +554,8 @@ class PrefixIndex:
         """Tombstone up to ``num`` unpinned device window pages; nodes keep
         their KV pages. A node's last ``trailing_pages`` window pages are what
         a hit ending at the node reads, so every node's other (interior) pages
-        go first, LRU nodes first within each pass."""
+        go first, LRU nodes first within each pass. Destinations of unlaunched
+        loads are pinned (by the service), so they are never taken."""
         order = [n for _, _, n in sorted((n.last_access, n.id, n) for n in self._window_nodes)]
         out: list[int] = []
         for interior_only in (True, False):
@@ -565,23 +566,41 @@ class PrefixIndex:
                 if pages is None:
                     continue
                 cut = len(pages) - trailing_pages if interior_only else len(pages)
+                taken = [
+                    j for j in range(max(0, cut))
+                    if pages[j] is not None and pages[j] not in self._window_pins
+                ][: num - len(out)]
+                if not taken:
+                    continue
+                # The pages are reused at once; a backup may still be reading them.
+                self._wait_copies(node)
                 kept = list(pages)
-                for j in range(max(0, cut)):
-                    w = kept[j]
-                    if w is not None and w not in self._window_pins and len(out) < num:
-                        out.append(w)
-                        kept[j] = None
+                for j in taken:
+                    out.append(kept[j])
+                    kept[j] = None
                 self._set_window_pages(node, kept)
         return out
 
     def evict_host_windows(self, num: int) -> list[int]:
-        """Drop up to ``num`` host window pages, LRU nodes first."""
+        """Drop up to ``num`` host window pages, LRU nodes first, skipping
+        nodes whose queued (unlaunched) load still reads them."""
         out: list[int] = []
         for _, _, node in sorted((n.last_access, n.id, n) for n in self._host_window_nodes):
             if len(out) >= num:
                 break
+            if node.h2d_op is not None and not node.h2d_op.launched:
+                continue
+            self._wait_copies(node)
             self._drop_host_windows(node, out)
         return out
+
+    @staticmethod
+    def _wait_copies(node: Node) -> None:
+        """Block until the node's launched copies finished (a deterministic
+        point in the call sequence, so replicas stay in lockstep)."""
+        for op in (node.d2h_op, node.h2d_op):
+            if op is not None:
+                op.wait()
 
     # ===== Eviction =====
 

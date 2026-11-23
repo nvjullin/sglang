@@ -13,6 +13,7 @@ from typing import (
 from sglang.srt.layers.cp.base import is_cp_sharded_padded
 from sglang.srt.layers.cp.utils import from_cp_sharded
 from sglang.srt.mem_cache.allocator.swa import is_swa_req_ring
+from sglang.srt.mem_cache.base_prefix_cache import lends_kv
 from sglang.srt.utils.common import ceil_align
 
 if TYPE_CHECKING:
@@ -243,8 +244,13 @@ class SchedulerPoolStatsObserver:
         return sum(kv_mamba_slots(kv) for kv in self._session_kv_rows())
 
     def get_pool_stats(self) -> PoolStats:
-        if self.tree_cache.lends_kv:
-            return self.tree_cache.pool_stats()
+        if lends_kv(self.tree_cache):
+            from sglang.srt.mem_cache.base_prefix_cache import window_sub_pool_of
+
+            return self.tree_cache.pool_stats(
+                windows=[u for u in self.storage.usage() if u.metrics == "window"],
+                target_window=window_sub_pool_of(self.token_to_kv_pool_allocator),
+            )
         usage = self.storage.usage()
         (full,) = (u for u in usage if u.metrics == "full")
         mamba = next((u for u in usage if u.metrics == "mamba"), None)

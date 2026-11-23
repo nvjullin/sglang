@@ -9,13 +9,13 @@ the borrow path instead.
 from __future__ import annotations
 
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, Callable
+from typing import TYPE_CHECKING, Any, Callable, Optional, Sequence
 
 from sglang.srt.managers.borrow_cache.client import BorrowCacheClient
 from sglang.srt.mem_cache.borrow.api import CacheKey
 from sglang.srt.mem_cache.base_prefix_cache import (
-    BasePrefixCache,
     EvictParams,
+    LendingPrefixCache,
     EvictResult,
     MatchPrefixParams,
     MatchResult,
@@ -23,6 +23,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.mem_cache.kv.storage import SubPoolUsage
     from sglang.srt.mem_cache.radix_cache import RadixKey
 
 
@@ -35,8 +36,7 @@ class _Root:
 _ROOT = _Root()
 
 
-class BorrowTreeFacade(BasePrefixCache):
-    lends_kv = True
+class BorrowTreeFacade(LendingPrefixCache):
 
     def __init__(
         self,
@@ -136,26 +136,62 @@ class BorrowTreeFacade(BasePrefixCache):
     def release_host_resources(self) -> None:
         self.client.close()
 
-    def pool_stats(self):
-        """Device KV usage as the cache service reports it."""
+    def pool_stats(self, *, windows: Sequence[SubPoolUsage], target_window: str):
+        """Device usage as the cache service reports it. The service's window
+        pages are the target's window sub-pool, named as in ``windows``."""
         from sglang.srt.managers.scheduler_components.pool_stats_observer import (
             PoolStats,
+            WindowPoolStats,
         )
 
         st = self.client.service.stats()
         used = st.device_slots - st.device_free_slots - st.device_evictable_slots
-        return PoolStats(
+        stats = PoolStats(
             full_num_used=used,
             full_token_usage=used / st.device_slots,
             full_available_size=st.device_free_slots,
             full_evictable_size=st.device_evictable_slots,
             full_capacity=st.device_slots,
+            target_window=target_window,
         )
+        if st.window_pages:
+            (usage,) = (u for u in windows if u.name == target_window)
+            ps = self.page_size
+            cap, free = st.window_pages * ps, st.window_free_pages * ps
+            evictable = st.evictable_window_pages * ps
+            stats.windows = (
+                WindowPoolStats(
+                    name=usage.label,
+                    sub_pool=usage.name,
+                    capacity=cap,
+                    available_size=free,
+                    evictable_size=evictable,
+                    num_used=cap - free - evictable,
+                    token_usage=(cap - free - evictable) / cap,
+                ),
+            )
+        if st.state_slots:
+            # Every cached state is evictable: none is pinned between calls.
+            held = st.state_slots - st.state_free_slots - st.cached_states
+            stats.is_hybrid_ssm = True
+            stats.mamba_capacity = st.state_slots
+            stats.mamba_num_used = held
+            stats.mamba_usage = held / st.state_slots
+            stats.mamba_available_size = st.state_free_slots
+            stats.mamba_evictable_size = st.cached_states
+        return stats
 
     def host_tier_usage(self) -> tuple[int, int]:
         """(used, total) host-tier tokens as the cache service reports them."""
         st = self.client.service.stats()
         return st.host_slots - st.host_free_slots, st.host_slots
+
+    def host_state_usage(self) -> Optional[tuple[int, int]]:
+        """(used, total) host-tier recurrent states; None without them."""
+        st = self.client.service.stats()
+        if not st.host_state_slots:
+            return None
+        return st.host_state_slots - st.host_state_free_slots, st.host_state_slots
 
     def available_and_evictable_str(self) -> str:
         st = self.client.service.stats()

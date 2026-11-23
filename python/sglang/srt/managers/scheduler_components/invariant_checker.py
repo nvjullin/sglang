@@ -38,7 +38,7 @@ from sglang.srt.managers.scheduler_components.state_check import (
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
 from sglang.srt.mem_cache.allocator.swa import is_swa_req_ring
-from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
+from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, lends_kv
 from sglang.srt.mem_cache.kv.requests import RequestTable, RowState
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.observability.scheduler_stage_metrics import (
@@ -407,6 +407,10 @@ class SchedulerInvariantChecker:
         return full_uncached, window_uncached
 
     def _check_busy_pools(self):
+        if lends_kv(self.tree_cache):
+            # A cache service owns the slots: requests' rows do not count the
+            # pages it shares between leases or the window pages they released.
+            return
         ps = self.pool_stats_observer.get_pool_stats()
         full_uncached, window_uncached = self._get_total_uncached_sizes(
             tuple(window.sub_pool for window in ps.windows)
@@ -450,6 +454,9 @@ class SchedulerInvariantChecker:
           A. no owner references a page that is in the free pool (use-after-free).
           B. the free pool has no duplicate pages (two owners freed the same page).
         All heavy work runs on GPU to avoid per-token device->host sync."""
+        if lends_kv(self.tree_cache):
+            # The slots come from a cache service, not this allocator's free pool.
+            return
         rtt = self.req_to_token_pool.req_to_token
         row_width = rtt.shape[1]
 

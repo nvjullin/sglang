@@ -37,6 +37,7 @@ from typing import TYPE_CHECKING, NamedTuple, Optional
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
     DecLockRefParams,
@@ -203,6 +204,9 @@ class UnifiedCacheLinker(ABC):
     pools: dict[PoolName, object]
     load_mode = "layer_wise"
     prefetch_policy = "timeout"
+    # Seconds between lease renewals of a stored page that requests keep
+    # hitting on the device (see renew_leases); 0 when the backend has none.
+    lease_renewal_interval_s = 0.0
     # None when the current stream is the only one using the pages.
     forward_stream: Optional[torch.cuda.Stream] = None
 
@@ -291,6 +295,15 @@ class UnifiedCacheLinker(ABC):
 
         ``session_id`` names the session whose insert produced the transfers,
         when known; backends may attribute the stored objects to it.
+        """
+
+    def renew_leases(self, page_hashes: list[str]) -> None:
+        """Mark these stored pages as just used, without blocking.
+
+        Requests keep hitting them on the device, which the store never sees.
+        A store that evicts by lease, as Mooncake does, would otherwise evict
+        them by when they were written, so they could be gone by the time the
+        device evicts them. Pages the store lacks are ignored.
         """
 
     @abstractmethod
@@ -395,6 +408,16 @@ class UnifiedCacheLinkerWrapper:
         self.pending_offloads: list[_PendingOffload] = []
         # Page-aligned radix-key prefix excluded from offload during an insert.
         self.offload_skip_prefix_len = 0
+        # Lease renewal of device-hit pages: when each path node last queued
+        # its pages, and the pages queued since the last flush.
+        self.lease_renewal_interval_s = (
+            cache_linker.lease_renewal_interval_s
+            if envs.SGLANG_ENABLE_LINKER_LEASE_RENEWAL.get()
+            else 0.0
+        )
+        self.lease_renewed_at: dict[NodeId, float] = {}
+        self.lease_renewal_hashes: list[str] = []
+        self.lease_pruned_at = 0.0
 
         cache.tree_core.enable_external_cache_linker = True
         cache.write_through_threshold = 1
@@ -416,6 +439,8 @@ class UnifiedCacheLinkerWrapper:
         key, _ = key.maybe_to_bigram_view(cache.tree_core.is_eagle)
         page = cache.page_size
         device_hit_len = result.device_prefix_len
+        if self.lease_renewal_interval_s > 0 and device_hit_len > 0:
+            self._note_device_hit(result.last_device_node)
         if self.load_mode == "prefetch":
             # Prefetch is issued on enqueue; only completed GPU KV is matchable.
             return result
@@ -686,6 +711,41 @@ class UnifiedCacheLinkerWrapper:
     def _record_lookup(self, lookup_tokens: int, hit_tokens: int) -> None:
         if self.metrics is not None:
             self.metrics.increment_linker_lookup_tokens(lookup_tokens, hit_tokens)
+
+    # ---- lease renewal: tell the store which stored pages the device serves ----
+
+    def _note_device_hit(self, node_id: NodeId) -> None:
+        """Queue the pages of the device path ending at ``node_id`` whose node
+        has not been renewed within the interval."""
+        tree_core = self.cache.tree_core
+        now = time.monotonic()
+        stale_before = now - self.lease_renewal_interval_s
+        (path,) = tree_core.collect_path_info([node_id])
+        for info in path:
+            if self.lease_renewed_at.get(info.node_id, stale_before) > stale_before:
+                continue
+            self.lease_renewed_at[info.node_id] = now
+            self.lease_renewal_hashes.extend(tree_core.get_hash_values(info.node_id))
+
+    def flush_lease_renewals(self) -> None:
+        """Hand the pages queued since the last call to the backend. Rank-local:
+        each rank and PP stage renews the objects it stores."""
+        if self.lease_renewal_interval_s <= 0:
+            return
+        if self.lease_renewal_hashes:
+            hashes, self.lease_renewal_hashes = self.lease_renewal_hashes, []
+            self.cache_linker.renew_leases(hashes)
+        now = time.monotonic()
+        if now - self.lease_pruned_at > self.lease_renewal_interval_s:
+            # Entries older than the interval read as stale anyway; dropping them
+            # also forgets nodes that have left the tree.
+            stale_before = now - self.lease_renewal_interval_s
+            self.lease_renewed_at = {
+                node_id: renewed_at
+                for node_id, renewed_at in self.lease_renewed_at.items()
+                if renewed_at > stale_before
+            }
+            self.lease_pruned_at = now
 
     def _lookup(self, rid: str, transfers: list[PoolTransfer]) -> list[int]:
         cache = self.cache
@@ -1052,6 +1112,8 @@ class UnifiedCacheLinkerWrapper:
         self.inflight_load_rids.clear()
         self.private_load_indices.clear()
         self.inflight_load_index = -1
+        self.lease_renewed_at.clear()
+        self.lease_renewal_hashes.clear()
         for pending in self.pending_offloads:
             self.cache.tree_core.finish_external_linker_offload(
                 pending.publish_node_ids, pending.lock_node_id, False

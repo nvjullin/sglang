@@ -59,6 +59,20 @@ until every rank stops writing, then discard them without publishing. Pending
 slots count toward GPU capacity. Reset and shutdown drain reads before freeing slots.
 The deprecated HiCache extra config is used only when linker JSON is omitted.
 
+### Direct linker lease renewal
+
+Mooncake evicts the objects whose lease ran out earliest, and only an existence
+query, a read or a repeated put renews a lease. The direct linker looks the store up only
+past the device prefix, so a page that requests keep hitting on the device would
+age out of the store and be lost once the device evicts it. The linker therefore
+renews the leases of the stored pages on each device hit's path, at most once per
+node per `lease_renewal_interval_s` seconds (default 30; `0` turns renewal off),
+set in the same JSON. Each rank renews only the objects it writes.
+
+A renewed object stays unevictable for the master's `--default_kv_lease_ttl`
+(10 s by default), so a shorter interval holds more of the store under lease.
+`SGLANG_ENABLE_LINKER_LEASE_RENEWAL=false` turns renewal off without a config change.
+
 ### Decode context parallelism (DCP)
 
 Mooncake L3 supports DCP for one materialized MLA KV pool and optional KDA

@@ -2,9 +2,10 @@ import ctypes
 import queue
 import sys
 import threading
+import time
 import unittest
 from array import array
-from collections import defaultdict
+from collections import Counter, defaultdict
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import replace
 from itertools import product
@@ -15,6 +16,7 @@ from unittest.mock import MagicMock, call, patch
 import pytest
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
@@ -2295,6 +2297,7 @@ def test_check_hicache_events_commits_common_rank_results():
         take_completed_offloads=lambda count, block: [True] * count,
         commit_completed_offloads=committed.append,
         check_prefetch_events=lambda: None,
+        flush_lease_renewals=MagicMock(),
     )
     cache.pp_size = 1
 
@@ -2314,6 +2317,7 @@ def test_check_hicache_events_commits_common_rank_results():
     cache.check_hicache_events()
 
     assert committed == [[False]]
+    cache.linker.flush_lease_renewals.assert_called_once_with()
 
 
 @pytest.mark.parametrize("pp_rank", [0, 2])
@@ -2392,6 +2396,7 @@ def test_pipeline_stages_commit_pp0_offload_results(pp_rank):
         take_completed_offloads=take_completed_offloads,
         commit_completed_offloads=committed.append,
         check_prefetch_events=lambda: None,
+        flush_lease_renewals=MagicMock(),
     )
 
     cache.check_hicache_events()
@@ -2400,6 +2405,7 @@ def test_pipeline_stages_commit_pp0_offload_results(pp_rank):
     assert committed == [[True, False]]
     cache._bound_async_work.assert_called_once_with()
     cache._all_reduce_attn_groups.assert_not_called()
+    cache.linker.flush_lease_renewals.assert_called_once_with()
 
 
 def test_mooncake_pipeline_lookup_intersects_every_stage():
@@ -2473,6 +2479,278 @@ def test_mooncake_stage_storages_key_each_later_stage():
     assert all(view.store is storage.store for view in views)
     assert storage.mla_suffix == "cp0_pp0"
     assert storage.pool_suffixes == {PoolName.KV: "tp1_dcp2r1_cp0_pp0"}
+
+
+class _LeaseRenewingLinker(_FakeLinker):
+    lease_renewal_interval_s = 30.0
+
+    def __init__(self):
+        super().__init__()
+        self.renewed = []
+
+    def renew_leases(self, page_hashes):
+        self.renewed.append(list(page_hashes))
+
+
+def _lease_renewal_wrapper(paths, hashes):
+    """A wrapper over a tree with the given device paths and per-node page hashes."""
+    tree_core = SimpleNamespace(
+        enable_external_cache_linker=False,
+        is_eagle=False,
+        collect_path_info=lambda node_ids: tuple(
+            tuple(SimpleNamespace(node_id=node) for node in paths[node_id])
+            for node_id in node_ids
+        ),
+        get_hash_values=lambda node_id: list(hashes[node_id]),
+    )
+    backend = _LeaseRenewingLinker()
+    cache = _cache_for_wrapper(tree_core=tree_core, page_size=1)
+    return UnifiedCacheLinkerWrapper(cache, backend), backend
+
+
+def _device_hit(wrapper, node_id, length):
+    """Match a key that the device holds entirely, ending at ``node_id``."""
+    result = MatchResult(
+        device_prefix_len=length,
+        last_device_node=node_id,
+        last_host_node=node_id,
+        best_match_node=node_id,
+    )
+    key = RadixKey(array("q", range(1, length + 1)))
+    assert wrapper.match(key, SimpleNamespace(rid="hit"), result) == result
+
+
+def test_lease_renewal_renews_every_stale_path_node_once_per_interval():
+    """A device hit renews each node on its path at most once per interval, and
+    a node whose renewal has lapsed is renewed even when a deeper node on the
+    same path is still fresh."""
+    paths = {3: (1, 2, 3), 4: (1, 2, 3, 4)}
+    hashes = {1: ["a", "b"], 2: ["c"], 3: ["d"], 4: ["e"]}
+    wrapper, backend = _lease_renewal_wrapper(paths, hashes)
+    clock = [100.0]
+
+    def hit_at(when, node_id, length):
+        clock[0] = when
+        _device_hit(wrapper, node_id, length)
+        wrapper.flush_lease_renewals()
+
+    with patch(
+        "sglang.srt.mem_cache.unified_cache.unified_cache_linker.time.monotonic",
+        lambda: clock[0],
+    ):
+        hit_at(100.0, 3, 4)
+        hit_at(110.0, 3, 4)
+        hit_at(115.0, 4, 5)
+        hit_at(131.0, 4, 5)
+
+    assert backend.renewed == [["a", "b", "c", "d"], ["e"], ["a", "b", "c", "d"]]
+
+
+def test_lease_renewal_env_switch_turns_it_off():
+    paths = {3: (1, 2, 3)}
+    hashes = {1: ["a"], 2: ["b"], 3: ["c"]}
+    with envs.SGLANG_ENABLE_LINKER_LEASE_RENEWAL.override(False):
+        wrapper, backend = _lease_renewal_wrapper(paths, hashes)
+    _device_hit(wrapper, 3, 3)
+    wrapper.flush_lease_renewals()
+
+    assert wrapper.lease_renewal_interval_s == 0
+    assert backend.renewed == []
+
+
+_MOONCAKE_LINKER = "sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker"
+
+
+def _renewal_linker(batch_is_exist, pools=(PoolName.KV, PoolName.COMPACT_INDEXER)):
+    """A Mooncake linker that offloads ``pools``, over a store whose keys are
+    ``m_<page>_<pool>``; start renewal with ``_start_lease_renewal``."""
+    linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
+    linker.storage = SimpleNamespace(
+        store=SimpleNamespace(batch_is_exist=batch_is_exist),
+        _get_hybrid_page_component_keys=lambda pages, transfer: (
+            [f"{page}_{transfer.name}" for page in pages],
+            1,
+        ),
+        _tag_keys=lambda keys: [f"m_{key}" for key in keys],
+    )
+    linker.offload_pools = set(pools)
+    linker.stats = {"renewal_attempted_pages": 0, "renewal_failed_keys": 0}
+    return linker
+
+
+def test_mooncake_lease_renewal_bounds_and_expires_pending_batches():
+    """Renewal work cannot grow without bound or replay stale recency: a full
+    queue drops its oldest batch, a batch older than the interval is dropped
+    unqueried, and the rest is renewed once per page in bounded queries."""
+    queried = []
+    linker = _renewal_linker(lambda keys: queried.append(list(keys)) or [1] * len(keys))
+    clock = [0.0]
+    with (
+        patch(f"{_MOONCAKE_LINKER}.threading.Thread"),
+        patch(f"{_MOONCAKE_LINKER}.MAX_PENDING_RENEWALS", 3),
+        patch(f"{_MOONCAKE_LINKER}.MAX_KEYS_PER_RENEWAL", 3),
+        patch(f"{_MOONCAKE_LINKER}.time.monotonic", lambda: clock[0]),
+    ):
+        linker._start_lease_renewal(30.0, tp_rank=0)
+        for when, pages in ((0, ["a"]), (10, ["s"]), (20, ["c", "d"]), (25, ["d"])):
+            clock[0] = when
+            linker.renew_leases(pages)
+        assert [batch for _, batch in linker.lease_renewal_pending] == [
+            ["s"],
+            ["c", "d"],
+            ["d"],
+        ]
+        clock[0] = 45.0
+        linker._renew_pending()
+
+    assert not linker.lease_renewal_pending
+    assert all(len(keys) <= 3 for keys in queried)
+    assert Counter(key for keys in queried for key in keys) == Counter(
+        f"m_{page}_{pool}" for page in "cd" for pool in ("kv", "compact_indexer")
+    )
+
+
+def test_mooncake_lease_renewal_stops_when_a_slow_query_outlives_the_interval():
+    """Expiry is judged before every query, not only when batches are taken:
+    after a query slower than the interval, the rest of the batch would lease
+    pages by hits older than the interval."""
+    clock = [0.0]
+    queried = []
+
+    def slow_batch_is_exist(keys):
+        queried.append(list(keys))
+        clock[0] += 31.0
+        return [1] * len(keys)
+
+    linker = _renewal_linker(slow_batch_is_exist, pools=(PoolName.KV,))
+    with (
+        patch(f"{_MOONCAKE_LINKER}.threading.Thread"),
+        patch(f"{_MOONCAKE_LINKER}.MAX_KEYS_PER_RENEWAL", 1),
+        patch(f"{_MOONCAKE_LINKER}.time.monotonic", lambda: clock[0]),
+    ):
+        linker._start_lease_renewal(30.0, tp_rank=0)
+        linker.renew_leases(["a", "b"])
+        linker._renew_pending()
+
+    assert queried == [["m_a_kv"]]
+
+
+def test_mooncake_lease_renewal_counts_failed_keys_and_survives_errors():
+    """batch_is_exist reports a master or RPC failure as a negative code per key
+    and raises only on bad arguments; neither may pass silently or stop renewal."""
+    calls = []
+
+    def batch_is_exist(keys):
+        calls.append(len(keys))
+        if len(calls) == 1:
+            raise TypeError("bad keys")
+        return [-1] * len(keys)
+
+    linker = _renewal_linker(batch_is_exist, pools=(PoolName.KV,))
+    with (
+        patch(f"{_MOONCAKE_LINKER}.threading.Thread"),
+        patch(f"{_MOONCAKE_LINKER}.logger") as logger,
+    ):
+        linker._start_lease_renewal(30.0, tp_rank=0)
+        linker.renew_leases(["a"])
+        linker._renew_pending()
+        linker.renew_leases(["b", "c"])
+        linker._renew_pending()
+
+    assert calls == [1, 2]
+    assert linker.stats == {"renewal_attempted_pages": 3, "renewal_failed_keys": 2}
+    assert [c.args for c in logger.warning.call_args_list] == [
+        ("Mooncake lease renewal failed",),
+        ("Mooncake lease renewal failed for %d of %d keys", 2, 2),
+    ]
+
+
+def test_mooncake_lease_renewal_renews_own_pools_and_close_drops_pending():
+    """A rank renews only the pools it writes (one rank renews a pool shared
+    across attention TP), and close() waits for at most the query in flight:
+    renewals still queued are dropped, not replayed."""
+    started, release = threading.Event(), threading.Event()
+    queried = []
+
+    def batch_is_exist(keys):
+        queried.append(list(keys))
+        started.set()
+        release.wait(10)
+        return [1] * len(keys)
+
+    no_writer = _renewal_linker(batch_is_exist, pools=())
+    no_writer._start_lease_renewal(30.0, tp_rank=1)
+    assert no_writer.lease_renewal_interval_s == 0
+    assert no_writer.lease_renewal_thread is None
+
+    linker = _renewal_linker(batch_is_exist, pools=(PoolName.KV,))
+    with patch(f"{_MOONCAKE_LINKER}.MAX_KEYS_PER_RENEWAL", 1):
+        linker._start_lease_renewal(30.0, tp_rank=0)
+        linker.renew_leases(["a", "x"])
+        assert started.wait(10)
+        linker.renew_leases(["b"])
+        stopper = threading.Thread(target=linker._stop_lease_renewal)
+        stopper.start()
+        for _ in range(1000):
+            if linker.lease_renewal_closing:
+                break
+            time.sleep(0.01)
+        release.set()
+        stopper.join(10)
+
+    assert not linker.lease_renewal_thread.is_alive()
+    assert queried == [["m_a_kv"]]
+
+
+def test_mooncake_lease_renewal_queries_the_keys_the_offload_writes():
+    """Renewal builds its store keys apart from the offload; if the two drift
+    (suffix, object name or config tag), every existence query misses and no
+    page is ever re-leased."""
+    pools = {
+        name: DevicePoolEntry(
+            name=name,
+            indices_from_pool=PoolName.KV,
+            device_pool=None,
+            components=[[torch.zeros((8, 4), dtype=torch.uint8)]],
+            layer_mapping={0: 0},
+            page_size=2,
+            rows_are_pages=False,
+        )
+        for name in (PoolName.KV, PoolName.COMPACT_INDEXER)
+    }
+    queried = []
+    store = MooncakeStore.__new__(MooncakeStore)
+    store.store = SimpleNamespace(
+        batch_is_exist=lambda keys: queried.append(list(keys)) or [1] * len(keys)
+    )
+    store.registered_pools = pools
+    store.unified_suffixes = None
+    store.mla_suffix = "cp0_pp1"
+    store.pool_suffixes = {PoolName.COMPACT_INDEXER: "tpshared_v1_cp0_pp1"}
+    store.config_prefix = "cfg"
+    store._use_group_semantics = False
+    pages = ["p0", "p1"]
+    # Every object already exists, so the write path stops at its existence check.
+    store._batch_io_v2(
+        [
+            PoolTransfer(name=name, keys=pages, host_indices=torch.arange(4))
+            for name in pools
+        ],
+        is_set=True,
+    )
+    (written,) = queried
+    queried.clear()
+
+    linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
+    linker.storage = store
+    linker.offload_pools = set(pools)
+    linker.stats = {"renewal_attempted_pages": 0, "renewal_failed_keys": 0}
+    with patch(f"{_MOONCAKE_LINKER}.threading.Thread"):
+        linker._start_lease_renewal(30.0, tp_rank=0)
+    linker.renew_leases(pages)
+    linker._renew_pending()
+
+    assert Counter(key for keys in queried for key in keys) == Counter(written)
 
 
 @pytest.mark.parametrize(

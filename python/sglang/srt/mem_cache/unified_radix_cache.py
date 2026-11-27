@@ -4725,6 +4725,7 @@ class UnifiedRadixCache(BasePrefixCache):
         if self.linker is not None:
             self._check_linker_offloads()
             self.linker.check_prefetch_events()
+            self.linker.flush_lease_renewals()
             return
 
         if self.enable_storage:

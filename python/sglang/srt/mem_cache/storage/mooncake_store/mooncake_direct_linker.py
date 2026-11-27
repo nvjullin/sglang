@@ -5,6 +5,7 @@ import hashlib
 import logging
 import threading
 import time
+from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor, wait
 from copy import deepcopy
 from queue import Empty, Queue
@@ -48,6 +49,17 @@ device_module = get_device_module()
 DEFAULT_LOAD_LAYER_GROUP = 8
 DEFAULT_LOAD_THREADS = 4
 MAX_RANGES_PER_READ = 4096
+# Arbitrary: well inside the minutes an unrenewed page survived in the store on
+# agentic traffic, and 3x the master's default lease TTL (10 s), so an object is
+# leased approximately a third of the time, assuming stable node identities and
+# one renewing instance; renewals are not staggered, so this does not cap how
+# many objects are leased at once.
+DEFAULT_LEASE_RENEWAL_INTERVAL_S = 30.0
+# Arbitrary; about the key count of one long lookup.
+MAX_KEYS_PER_RENEWAL = 8192
+# Arbitrary; batches older than the interval are dropped anyway, so this only
+# bounds memory while the master is slow.
+MAX_PENDING_RENEWALS = 64
 
 
 def _storage_suffix(
@@ -216,6 +228,14 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             1, int(extra_config.get("linker_load_threads", DEFAULT_LOAD_THREADS))
         )
         self.load_mode = extra_config.pop("load_mode", "layer_wise")
+        lease_renewal_interval_s = max(
+            0.0,
+            float(
+                extra_config.pop(
+                    "lease_renewal_interval_s", DEFAULT_LEASE_RENEWAL_INTERVAL_S
+                )
+            ),
+        )
         # TODO: unlike `HiCacheController._generate_storage_config`, this sets no
         # `dp_rank`. Aligning the storage-config producers changes persisted
         # storage keys, so it waits for a storage-key format change.
@@ -332,7 +352,13 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             tuple[list[PoolTransfer], int, list[object], str | None] | None
         ] = Queue()
         self.offload_results: Queue[bool] = Queue()
-        self.stats = {"lookup": 0, "load": 0, "offload": 0}
+        self.stats = {
+            "lookup": 0,
+            "load": 0,
+            "offload": 0,
+            "renewal_attempted_pages": 0,
+            "renewal_failed_keys": 0,
+        }
         self.load_io_executor = ThreadPoolExecutor(
             self.load_threads, thread_name_prefix=f"mooncake-load-io-tp{tp_rank}"
         )
@@ -348,6 +374,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             name=f"mooncake-offload-tp{tp_rank}",
         )
         self.offload_thread.start()
+        self._start_lease_renewal(lease_renewal_interval_s, tp_rank)
 
     def register_buffers(self) -> None:
         seen = set()
@@ -809,6 +836,104 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             finally:
                 self.offload_queue.task_done()
 
+    def _start_lease_renewal(self, interval_s: float, tp_rank: int) -> None:
+        # A rank renews only the objects it writes, so a pool shared across
+        # attention TP is renewed by one rank.
+        self.lease_renewal_pools = sorted(self.offload_pools)
+        self.lease_renewal_interval_s = interval_s if self.lease_renewal_pools else 0.0
+        # (queued_at, page hashes) per flush; a full deque drops its oldest batch.
+        self.lease_renewal_pending: deque[tuple[float, list[str]]] = deque(
+            maxlen=MAX_PENDING_RENEWALS
+        )
+        self.lease_renewal_wake = threading.Event()
+        self.lease_renewal_closing = False
+        self.lease_renewal_warned_at = float("-inf")
+        self.lease_renewal_thread = None
+        if self.lease_renewal_interval_s > 0:
+            self.lease_renewal_thread = threading.Thread(
+                target=self.lease_renewal_thread_func,
+                daemon=True,
+                name=f"mooncake-lease-tp{tp_rank}",
+            )
+            self.lease_renewal_thread.start()
+
+    def _stop_lease_renewal(self) -> None:
+        # Pending renewals are dropped: at most the RPC in flight completes.
+        self.lease_renewal_closing = True
+        self.lease_renewal_pending.clear()
+        self.lease_renewal_wake.set()
+        self.lease_renewal_thread.join()
+
+    def renew_leases(self, page_hashes: list[str]) -> None:
+        if self.lease_renewal_thread is None or not page_hashes:
+            return
+        self.lease_renewal_pending.append((time.monotonic(), page_hashes))
+        self.lease_renewal_wake.set()
+
+    def lease_renewal_thread_func(self) -> None:
+        while True:
+            self.lease_renewal_wake.wait()
+            self.lease_renewal_wake.clear()
+            if self.lease_renewal_closing:
+                return
+            self._renew_pending()
+
+    def _renew_pending(self) -> None:
+        # A batch older than the interval is redundant for the pages still hit
+        # on the device, whose nodes were queued again, and stale for the rest.
+        stale_before = time.monotonic() - self.lease_renewal_interval_s
+        pages = []
+        oldest = float("inf")
+        for _ in range(len(self.lease_renewal_pending)):
+            try:
+                queued_at, batch = self.lease_renewal_pending.popleft()
+            except IndexError:
+                break
+            if queued_at > stale_before:
+                pages.extend(batch)
+                oldest = min(oldest, queued_at)
+        pages = list(dict.fromkeys(pages))
+        if not pages:
+            return
+        self.stats["renewal_attempted_pages"] += len(pages)
+        failed = 0
+        try:
+            keys = []
+            for pool in self.lease_renewal_pools:
+                pool_keys, _ = self.storage._get_hybrid_page_component_keys(
+                    pages, PoolTransfer(name=pool, keys=pages)
+                )
+                keys.extend(self.storage._tag_keys(pool_keys))
+            for start in range(0, len(keys), MAX_KEYS_PER_RENEWAL):
+                # A slow query can outlive the interval; the rest of the batch
+                # would then lease pages by hits older than the interval.
+                if (
+                    self.lease_renewal_closing
+                    or time.monotonic() - oldest >= self.lease_renewal_interval_s
+                ):
+                    return
+                # The existence query leases every object it finds (master
+                # default_kv_lease_ttl), which re-ranks it for eviction; a
+                # negative result is an error code, 0 an absent object.
+                results = self.storage.store.batch_is_exist(
+                    keys[start : start + MAX_KEYS_PER_RENEWAL]
+                )
+                failed += sum(1 for result in results if result < 0)
+        except Exception:
+            logger.warning("Mooncake lease renewal failed", exc_info=True)
+            return
+        finally:
+            self.stats["renewal_failed_keys"] += failed
+        now = time.monotonic()
+        if (
+            failed
+            and now - self.lease_renewal_warned_at >= self.lease_renewal_interval_s
+        ):
+            self.lease_renewal_warned_at = now
+            logger.warning(
+                "Mooncake lease renewal failed for %d of %d keys", failed, len(keys)
+            )
+
     def num_completed_offloads(self) -> int:
         return self.offload_results.qsize()
 
@@ -834,6 +959,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self.offload_queue.put(None)
         self.load_thread.join()
         self.offload_thread.join()
+        if self.lease_renewal_thread is not None:
+            self._stop_lease_renewal()
         self.load_io_executor.shutdown()
         logger.info("Mooncake direct linker stats: %s", self.stats)
         self.storage.close()

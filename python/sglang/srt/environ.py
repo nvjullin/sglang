@@ -1005,6 +1005,9 @@ class Envs:
     # ===================================================================
     SGLANG_HICACHE_MOONCAKE_CONFIG_PATH = EnvStr(None)
     SGLANG_HICACHE_MOONCAKE_REUSE_TE = EnvBool(True)
+    # Kill switch for the external linker's renewal of store leases on pages
+    # that requests keep hitting on the device.
+    SGLANG_ENABLE_LINKER_LEASE_RENEWAL = EnvBool(True)
     MOONCAKE_MASTER = EnvStr(None)
     MOONCAKE_CLIENT = EnvStr(None)
     MOONCAKE_LOCAL_HOSTNAME = EnvStr("localhost")
